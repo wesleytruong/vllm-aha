@@ -1,28 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-# Adapted from
-# https://github.com/huggingface/transformers/blob/main/src/transformers/models/olmo2/modeling_olmo2.py
-# Copyright 2024 The vLLM team.
-# Copyright 2024 EleutherAI and the HuggingFace Inc. team. All rights reserved.
-#
-# This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
-# and OPT implementations in this library. It has been modified from its
-# original forms to accommodate minor architectural differences compared
-# to GPT-NeoX and OPT used by the Meta AI team that trained the model.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-"""Inference-only OLMo2 model compatible with HuggingFace weights."""
+# Adapted from OLMo2 for All-or-Here Attention (AHA)
+# https://huggingface.co/xuan-luo/AHA-OLMO2
+# AHA uses a learned per-head gate to route between global and local attention
+"""Inference-only OLMo2-AHA model with All-or-Here Attention."""
 
 from collections.abc import Iterable
 from functools import partial
@@ -42,8 +24,8 @@ from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
     MergedColumnParallelLinear,
-    QKVParallelLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -56,27 +38,34 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import SupportsLoRA, SupportsPP
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
-    extract_layer_index,
     is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
 )
 from vllm.sequence import IntermediateTensors
-from vllm.transformers_utils.configs import Olmo3Config
+
+# AHA Configuration
+LOCAL_WINDOW_SIZE = 128
 
 
-class Olmo2Attention(nn.Module):
+class Olmo2AHAAttention(nn.Module):
     """
-    This is the attention block where the output is computed as
-    `Attention(LN(x))` in `MLP(LN(x + Attention(LN(x))))`
-    (plus another skip connection).
+    All-or-Here Attention (AHA) block.
+
+    This attention computes both global (full) and local (sliding window)
+    attention, then uses a learned per-head gate to blend the outputs:
+
+    output = gate * global_attn + (1 - gate) * local_attn
+
+    For inference, we use hard gating (gate > 0.5) to select between outputs.
     """
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
-        assert isinstance(self.config, (Olmo2Config, Olmo3Config))
+        # FAOlmo uses a custom config, not Olmo2Config
+        # assert isinstance(self.config, Olmo2Config)
 
         hidden_size = self.config.hidden_size
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -99,58 +88,82 @@ class Olmo2Attention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.max_position_embeddings = self.config.max_position_embeddings
-
-        # Attention input projection. Projects x -> (q, k, v)
-        self.qkv_proj = QKVParallelLinear(
-            hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
-            bias=False,
-            quant_config=vllm_config.quant_config,
-            prefix=f"{prefix}.qkv_proj",
-        )
+        self.scaling = self.head_dim**-0.5
 
         self.tp_rank = get_tensor_model_parallel_rank()
+
+        # Q projection WITH GATE (matches FAOlmo weight shape)
+        # Output: [Q (num_heads * head_dim), gate (num_heads)]
+        # Note: FAOlmo uses total dimensions, ColumnParallelLinear will shard
+        self.q_proj = ColumnParallelLinear(
+            hidden_size,
+            self.total_num_heads * self.head_dim + self.total_num_heads,
+            bias=False,
+            quant_config=vllm_config.quant_config,
+            prefix=f"{prefix}.q_proj",
+        )
+
+        # Separate K, V projections (matches FAOlmo structure)
+        self.k_proj = ColumnParallelLinear(
+            hidden_size,
+            self.total_num_kv_heads * self.head_dim,
+            bias=False,
+            quant_config=vllm_config.quant_config,
+            prefix=f"{prefix}.k_proj",
+        )
+        self.v_proj = ColumnParallelLinear(
+            hidden_size,
+            self.total_num_kv_heads * self.head_dim,
+            bias=False,
+            quant_config=vllm_config.quant_config,
+            prefix=f"{prefix}.v_proj",
+        )
+
+        # QK normalization (same as OLMo2)
+        self.q_norm = RMSNorm(
+            self.config.hidden_size,
+            eps=self.config.rms_norm_eps,
+        )
         self.k_norm = RMSNorm(
             self.total_num_kv_heads * self.head_dim,
             eps=self.config.rms_norm_eps,
         )
-        self.q_norm = RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
 
-        self.scaling = self.head_dim**-0.5
-
-        layer_idx = extract_layer_index(prefix)
-        sliding_window = None
-        if (
-            layer_types := getattr(self.config, "layer_types", None)
-        ) is not None and layer_types[layer_idx] == "sliding_attention":
-            sliding_window = self.config.sliding_window
-
-        self.attn = Attention(
-            self.num_heads,
-            self.head_dim,
-            self.scaling,
-            num_kv_heads=self.num_kv_heads,
-            cache_config=vllm_config.cache_config,
-            quant_config=vllm_config.quant_config,
-            per_layer_sliding_window=sliding_window,
-            prefix=f"{prefix}.attn",
-        )
-
-        # Rotary embeddings. Rope scaling is only applied on full attention layers.
-        if sliding_window is None:
-            rope_parameters = self.config.rope_parameters
-        else:
-            rope_theta = self.config.rope_parameters["rope_theta"]
-            rope_parameters = {"rope_type": "default", "rope_theta": rope_theta}
+        # Rotary embeddings
+        rope_parameters = self.config.rope_parameters
         self.rotary_emb = get_rope(
             self.head_dim,
             max_position=self.max_position_embeddings,
             rope_parameters=rope_parameters,
         )
 
-        # Attention output projection.
+        # === DUAL ATTENTION LAYERS ===
+        # Global attention: full context, owns the KV cache
+        self.global_attn = Attention(
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            num_kv_heads=self.num_kv_heads,
+            cache_config=vllm_config.cache_config,
+            quant_config=vllm_config.quant_config,
+            per_layer_sliding_window=None,  # Full attention
+            prefix=f"{prefix}.global_attn",
+        )
+
+        # Local attention: sliding window, SHARES KV cache with global
+        self.local_attn = Attention(
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            num_kv_heads=self.num_kv_heads,
+            cache_config=vllm_config.cache_config,
+            quant_config=vllm_config.quant_config,
+            per_layer_sliding_window=LOCAL_WINDOW_SIZE,
+            prefix=f"{prefix}.local_attn",
+            kv_sharing_target_layer_name=f"{prefix}.global_attn",  # Share KV cache
+        )
+
+        # Output projection
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
@@ -168,9 +181,11 @@ class Olmo2Attention(nn.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
         if self.tp_size > 1:
-            splitter = partial(split_tensor_along_last_dim, num_partitions=self.tp_size)
-            q = splitter(q)[self.tp_rank]
-            k = splitter(k)[self.tp_rank]
+            splitter = partial(
+                split_tensor_along_last_dim, num_partitions=self.tp_size
+            )
+            q = splitter(q)[self.tp_rank].contiguous()
+            k = splitter(k)[self.tp_rank].contiguous()
         return q, k
 
     def forward(
@@ -178,30 +193,65 @@ class Olmo2Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        # === Project Q with gate ===
+        q_with_gate, _ = self.q_proj(hidden_states)
+        # Split Q and gate
+        # After TP sharding: q_size = num_heads * head_dim, gate_size = num_heads
+        q, gate = q_with_gate.split([self.q_size, self.num_heads], dim=-1)
+        # Make tensors contiguous after split to ensure proper memory layout
+        q = q.contiguous()
+        gate = gate.contiguous()
+
+        # === Project K, V ===
+        k, _ = self.k_proj(hidden_states)
+        v, _ = self.v_proj(hidden_states)
+
+        # === Apply QK normalization ===
         q, k = self._apply_qk_norm(q, k)
+
+        # === Apply rotary embeddings ===
         q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v)
-        output, _ = self.o_proj(attn_output)
+
+        # === Global attention (updates KV cache) ===
+        global_output = self.global_attn(q, k, v)
+
+        # === Local attention (uses shared KV cache, applies sliding window) ===
+        # Pass None for k, v since we're sharing the KV cache
+        local_output = self.local_attn(q, None, None)
+
+        # === Hard gate routing ===
+        gate_sigmoid = torch.sigmoid(gate)  # [num_tokens, num_heads]
+        gate_hard = (gate_sigmoid > 0.5).to(hidden_states.dtype)
+
+        # === Blend outputs per-head ===
+        num_tokens = global_output.shape[0]
+        global_out = global_output.view(num_tokens, self.num_heads, self.head_dim)
+        local_out = local_output.view(num_tokens, self.num_heads, self.head_dim)
+        gate_hard = gate_hard.unsqueeze(-1)  # [num_tokens, num_heads, 1]
+
+        # gate=1 -> global, gate=0 -> local
+        blended = global_out * gate_hard + local_out * (1.0 - gate_hard)
+        blended = blended.view(num_tokens, -1)
+
+        # === Output projection ===
+        output, _ = self.o_proj(blended)
         return output
 
 
-class Olmo2MLP(nn.Module):
+class Olmo2AHAMLP(nn.Module):
     """
-    This is the MLP block where the output is computed as
-    `MLP(x)` in `LN(MLP(x + LN(Attention(x))))`
-    (plus another skip connection).
+    MLP block (same as standard OLMo2).
     """
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_config
-        assert isinstance(config, (Olmo2Config, Olmo3Config))
+        # FAOlmo uses a custom config
+        # assert isinstance(config, Olmo2Config)
         hidden_size = config.hidden_size
         intermediate_size = config.intermediate_size
 
-        # Feed-forward input projection.
+        # Feed-forward input projection
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
@@ -210,10 +260,10 @@ class Olmo2MLP(nn.Module):
             prefix=f"{prefix}.gate_up_proj",
         )
 
-        # Activation function.
+        # Activation function
         self.act_fn = SiluAndMul()
 
-        # Feed-forward output projection.
+        # Feed-forward output projection
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
@@ -222,40 +272,36 @@ class Olmo2MLP(nn.Module):
             prefix=f"{prefix}.down_proj",
         )
 
-    def forward(
-        self,
-        x: torch.Tensor,
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
 
 
-class Olmo2DecoderLayer(nn.Module):
+class Olmo2AHADecoderLayer(nn.Module):
     """
-    This is a typical transformer block where the output is
-    computed as `MLP(LN(x + Attention(LN(x))))`
-    (plus another skip connection).
+    Transformer decoder layer with AHA attention.
     """
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_config
-        assert isinstance(config, (Olmo2Config, Olmo3Config))
-        # Attention block.
-        self.self_attn = Olmo2Attention(
+        # FAOlmo uses a custom config
+        # assert isinstance(config, Olmo2Config)
+
+        # AHA Attention block
+        self.self_attn = Olmo2AHAAttention(
             vllm_config=vllm_config, prefix=f"{prefix}.self_attn"
         )
 
-        # MLP block.
-        self.mlp = Olmo2MLP(vllm_config=vllm_config, prefix=f"{prefix}.mlp")
+        # MLP block
+        self.mlp = Olmo2AHAMLP(vllm_config=vllm_config, prefix=f"{prefix}.mlp")
 
         # LayerNorm
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-
         self.post_feedforward_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
@@ -265,13 +311,13 @@ class Olmo2DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        # Attention block.
+        # Attention block
         residual = hidden_states
         hidden_states = self.self_attn(positions, hidden_states)
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = hidden_states + residual
 
-        # MLP block.
+        # MLP block
         residual = hidden_states
         hidden_states = self.mlp(hidden_states)
         hidden_states = self.post_feedforward_layernorm(hidden_states)
@@ -280,11 +326,16 @@ class Olmo2DecoderLayer(nn.Module):
 
 
 @support_torch_compile
-class Olmo2Model(nn.Module):
+class Olmo2AHAModel(nn.Module):
+    """
+    OLMo2-AHA model backbone.
+    """
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
-        assert isinstance(self.config, (Olmo2Config, Olmo3Config))
+        # FAOlmo uses a custom config, not Olmo2Config
+        # assert isinstance(self.config, Olmo2Config)
 
         self.embed_tokens = VocabParallelEmbedding(
             self.config.vocab_size,
@@ -293,7 +344,9 @@ class Olmo2Model(nn.Module):
         )
         self.start_layer, self.end_layer, self.layers = make_layers(
             self.config.num_hidden_layers,
-            lambda prefix: Olmo2DecoderLayer(vllm_config=vllm_config, prefix=prefix),
+            lambda prefix: Olmo2AHADecoderLayer(
+                vllm_config=vllm_config, prefix=prefix
+            ),
             prefix=f"{prefix}.layers",
         )
         self.norm = RMSNorm(
@@ -314,83 +367,75 @@ class Olmo2Model(nn.Module):
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
-        """
-        :param input_ids: A tensor of shape `(batch_size, seq_len)`.
-        """
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
-            # Get embeddings of input.
-            # shape: (batch_size, seq_len, d_model)
             else:
                 hidden_states = self.embed_tokens(input_ids)
-
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             assert isinstance(hidden_states, torch.Tensor)
 
-        # Apply blocks one-by-one.
+        # Apply decoder layers
         for layer in islice(self.layers, self.start_layer, self.end_layer):
-            # shape: (batch_size, seq_len, d_model)
             hidden_states = layer(positions, hidden_states)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
 
-        # Apply final layer norm.
-        # shape: (batch_size, seq_len or 1, d_model)
+        # Apply final layer norm
         hidden_states = self.norm(hidden_states)
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # FAOlmo uses separate Q, K, V projections (not fused QKV)
+        # Only MLP gate_up_proj needs stacking
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
 
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         loaded_params: set[str] = set()
+
         for name, loaded_weight in weights:
             if is_pp_missing_parameter(name, self):
                 continue
+
+            # Check for stacked params (MLP gate_up_proj)
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 param = params_dict[name]
-                weight_loader = param.weight_loader  # type: ignore
+                weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                # Skip loading extra bias for GPTQ models.
+                # Direct loading for Q, K, V, O projections and norms
                 if name.endswith(".bias") and name not in params_dict:
+                    continue
+                if name not in params_dict:
                     continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+
             loaded_params.add(name)
         return loaded_params
 
 
-class Olmo2ForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
+class Olmo2AHAForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
     """
-    Extremely barebones HF model wrapper.
+    OLMo2 with All-or-Here Attention (AHA) for causal language modeling.
     """
 
+    # No QKV fusion for AHA - only MLP gate_up_proj is packed
     packed_modules_mapping = {
-        "qkv_proj": [
-            "q_proj",
-            "k_proj",
-            "v_proj",
-        ],
         "gate_up_proj": [
             "gate_proj",
             "up_proj",
@@ -400,9 +445,10 @@ class Olmo2ForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_config
-        assert isinstance(config, (Olmo2Config, Olmo3Config))
+        # FAOlmo uses a custom config
+        # assert isinstance(config, Olmo2Config)
         self.config = config
-        self.model = Olmo2Model(
+        self.model = Olmo2AHAModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
         if config.tie_word_embeddings:
@@ -452,4 +498,3 @@ class Olmo2ForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
             ),
         )
         return loader.load_weights(weights)
-
