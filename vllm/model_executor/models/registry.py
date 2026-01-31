@@ -167,7 +167,8 @@ _TEXT_GENERATION_MODELS = {
     "OlmoForCausalLM": ("olmo", "OlmoForCausalLM"),
     "Olmo2ForCausalLM": ("olmo2", "Olmo2ForCausalLM"),
     "Olmo3ForCausalLM": ("olmo2", "Olmo2ForCausalLM"),
-    "FAOlmoForCausalLM": ("olmo2_aha", "Olmo2AHAForCausalLM"),
+    # FAOlmo: Use VLLM_AHA_BASELINE=1 env var to use baseline implementation
+    "FAOlmoForCausalLM": ("olmo2_aha_baseline", "Olmo2AHABaselineForCausalLM") if os.environ.get("VLLM_AHA_BASELINE") else ("olmo2_aha", "Olmo2AHAForCausalLM"),
     "OlmoeForCausalLM": ("olmoe", "OlmoeForCausalLM"),
     "OPTForCausalLM": ("opt", "OPTForCausalLM"),
     "OrionForCausalLM": ("orion", "OrionForCausalLM"),
