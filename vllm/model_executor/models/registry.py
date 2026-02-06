@@ -165,7 +165,10 @@ _TEXT_GENERATION_MODELS = {
     "NemotronHForCausalLM": ("nemotron_h", "NemotronHForCausalLM"),
     "NemotronHPuzzleForCausalLM": ("nemotron_h", "NemotronHForCausalLM"),
     "OlmoForCausalLM": ("olmo", "OlmoForCausalLM"),
-    "Olmo2ForCausalLM": ("olmo2", "Olmo2ForCausalLM"),
+    # Olmo2: Use VLLM_LOCAL_ONLY=1 env var to use local-only sliding window implementation
+    "Olmo2ForCausalLM": ("olmo2_local_only", "Olmo2LocalOnlyForCausalLM")
+        if os.environ.get("VLLM_LOCAL_ONLY")
+        else ("olmo2", "Olmo2ForCausalLM"),
     "Olmo3ForCausalLM": ("olmo2", "Olmo2ForCausalLM"),
     # FAOlmo: Use VLLM_AHA_BASELINE=1 env var to use baseline implementation
     "FAOlmoForCausalLM": ("olmo2_aha_baseline", "Olmo2AHABaselineForCausalLM") if os.environ.get("VLLM_AHA_BASELINE") else ("olmo2_aha", "Olmo2AHAForCausalLM"),
