@@ -212,16 +212,16 @@ class Olmo2AHAAttention(nn.Module):
         # === Apply rotary embeddings ===
         q, k = self.rotary_emb(positions, q, k)
 
+        # === Hard gate routing ===
+        gate_sigmoid = torch.sigmoid(gate)  # [num_tokens, num_heads]
+        gate_hard = (gate_sigmoid > 0.5).to(hidden_states.dtype)
+
         # === Global attention (updates KV cache) ===
         global_output = self.global_attn(q, k, v)
 
         # === Local attention (uses shared KV cache, applies sliding window) ===
         # Pass None for k, v since we're sharing the KV cache
         local_output = self.local_attn(q, None, None)
-
-        # === Hard gate routing ===
-        gate_sigmoid = torch.sigmoid(gate)  # [num_tokens, num_heads]
-        gate_hard = (gate_sigmoid > 0.5).to(hidden_states.dtype)
 
         # === Blend outputs per-head ===
         num_tokens = global_output.shape[0]
