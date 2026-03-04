@@ -4,15 +4,26 @@
 # Adapted from OLMo2 for All-or-Here Attention (AHA)
 # https://huggingface.co/xuan-luo/AHA-OLMO2
 # AHA uses a learned per-head gate to route between global and local attention
-"""Inference-only OLMo2-AHA model with All-or-Here Attention."""
+"""Inference-only FAOlmo model with All-or-Here Attention (AHA).
 
+A single unified file containing all four attention implementations:
+  - "dual"     : always runs both global+local kernels, blends via gate
+  - "baseline" : alias for "dual" (frozen reference benchmark)
+  - "routed"   : per-GQA-group decode loop, skips unneeded attention types
+  - "greedy"   : local-first decode (1-2 kernel calls total)
+
+The active implementation is selected from config.attention_implementation.
+The local sliding-window size is read from config.local_window_size (default 128).
+"""
+
+import json
+import os
 from collections.abc import Iterable
 from functools import partial
 from itertools import islice
 
 import torch
 from torch import nn
-from transformers import Olmo2Config
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
@@ -20,8 +31,11 @@ from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.distributed.communication_op import tensor_model_parallel_all_gather
 from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 from vllm.distributed.utils import split_tensor_along_last_dim
+from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.attention.attention import get_attention_context
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -44,28 +58,69 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.sequence import IntermediateTensors
+from vllm.v1.attention.backends.fa_utils import (
+    flash_attn_varlen_func,
+    reshape_and_cache_flash,
+)
 
-# AHA Configuration
-LOCAL_WINDOW_SIZE = 128
+logger = init_logger(__name__)
+
+# ── Gate statistics logging ──────────────────────────────────────────────────
+_GATE_STATS_ENABLED = bool(os.environ.get("VLLM_AHA_GATE_STATS"))
+_gate_stats_counter = 0
+_GATE_STATS_INTERVAL = 100
+
+# ── Phase timing ─────────────────────────────────────────────────────────────
+_TIMING_ENABLED = bool(os.environ.get("VLLM_AHA_TIMING"))
+_TIMING_LOG_INTERVAL = 100
+
+# Greedy timing globals
+_timing_stats: dict[str, float] = {
+    "kv_update": 0.0, "local_attn": 0.0, "global_attn": 0.0,
+}
+_timing_totals: dict[str, float] = {
+    "kv_update": 0.0, "local_attn": 0.0, "global_attn": 0.0,
+}
+_timing_count = 0
+_local_only_calls = 0
+_global_calls = 0
+_total_global_groups = 0
+_TIMING_OUTPUT_FILE_GREEDY = os.environ.get(
+    "VLLM_AHA_TIMING_FILE", "/tmp/aha_timing_stats.json"
+)
+
+# Routed timing globals
+_routed_timing_stats: dict[str, float] = {
+    "kv_update": 0.0, "local_attn": 0.0, "global_attn": 0.0,
+}
+_routed_timing_totals: dict[str, float] = {
+    "kv_update": 0.0, "local_attn": 0.0, "global_attn": 0.0,
+}
+_routed_timing_count = 0
+_all_local_groups = 0
+_all_global_groups = 0
+_mixed_groups = 0
+_TIMING_OUTPUT_FILE_ROUTED = os.environ.get(
+    "VLLM_AHA_TIMING_FILE", "/tmp/aha_timing_stats_routed.json"
+)
 
 
-class Olmo2AHAAttention(nn.Module):
+# ═══════════════════════════════════════════════════════════════════════════════
+# Private attention implementations
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class _AHADualAttention(nn.Module):
     """
-    All-or-Here Attention (AHA) block.
+    All-or-Here Attention — dual kernel implementation.
 
-    This attention computes both global (full) and local (sliding window)
-    attention, then uses a learned per-head gate to blend the outputs:
-
-    output = gate * global_attn + (1 - gate) * local_attn
-
-    For inference, we use hard gating (gate > 0.5) to select between outputs.
+    Always runs both global (full) and local (sliding window) attention,
+    then blends per-head via a learned gate:
+        output = gate * global + (1 - gate) * local
     """
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
-        # FAOlmo uses a custom config, not Olmo2Config
-        # assert isinstance(self.config, Olmo2Config)
 
         hidden_size = self.config.hidden_size
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -89,12 +144,10 @@ class Olmo2AHAAttention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.max_position_embeddings = self.config.max_position_embeddings
         self.scaling = self.head_dim**-0.5
+        self.local_window_size = getattr(self.config, "local_window_size", 128)
 
         self.tp_rank = get_tensor_model_parallel_rank()
 
-        # Q projection WITH GATE (matches FAOlmo weight shape)
-        # Output: [Q (num_heads * head_dim), gate (num_heads)]
-        # Note: FAOlmo uses total dimensions, ColumnParallelLinear will shard
         self.q_proj = ColumnParallelLinear(
             hidden_size,
             self.total_num_heads * self.head_dim + self.total_num_heads,
@@ -102,8 +155,6 @@ class Olmo2AHAAttention(nn.Module):
             quant_config=vllm_config.quant_config,
             prefix=f"{prefix}.q_proj",
         )
-
-        # Separate K, V projections (matches FAOlmo structure)
         self.k_proj = ColumnParallelLinear(
             hidden_size,
             self.total_num_kv_heads * self.head_dim,
@@ -119,17 +170,11 @@ class Olmo2AHAAttention(nn.Module):
             prefix=f"{prefix}.v_proj",
         )
 
-        # QK normalization (same as OLMo2)
-        self.q_norm = RMSNorm(
-            self.config.hidden_size,
-            eps=self.config.rms_norm_eps,
-        )
+        self.q_norm = RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
         self.k_norm = RMSNorm(
-            self.total_num_kv_heads * self.head_dim,
-            eps=self.config.rms_norm_eps,
+            self.total_num_kv_heads * self.head_dim, eps=self.config.rms_norm_eps
         )
 
-        # Rotary embeddings
         rope_parameters = self.config.rope_parameters
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -137,7 +182,6 @@ class Olmo2AHAAttention(nn.Module):
             rope_parameters=rope_parameters,
         )
 
-        # === DUAL ATTENTION LAYERS ===
         # Global attention: full context, owns the KV cache
         self.global_attn = Attention(
             self.num_heads,
@@ -146,11 +190,10 @@ class Olmo2AHAAttention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             cache_config=vllm_config.cache_config,
             quant_config=vllm_config.quant_config,
-            per_layer_sliding_window=None,  # Full attention
+            per_layer_sliding_window=None,
             prefix=f"{prefix}.global_attn",
         )
-
-        # Local attention: sliding window, SHARES KV cache with global
+        # Local attention: sliding window, shares KV cache with global
         self.local_attn = Attention(
             self.num_heads,
             self.head_dim,
@@ -158,12 +201,11 @@ class Olmo2AHAAttention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             cache_config=vllm_config.cache_config,
             quant_config=vllm_config.quant_config,
-            per_layer_sliding_window=LOCAL_WINDOW_SIZE,
+            per_layer_sliding_window=self.local_window_size,
             prefix=f"{prefix}.local_attn",
-            kv_sharing_target_layer_name=f"{prefix}.global_attn",  # Share KV cache
+            kv_sharing_target_layer_name=f"{prefix}.global_attn",
         )
 
-        # Output projection
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
@@ -193,65 +235,925 @@ class Olmo2AHAAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        # === Project Q with gate ===
         q_with_gate, _ = self.q_proj(hidden_states)
-        # Split Q and gate
-        # After TP sharding: q_size = num_heads * head_dim, gate_size = num_heads
         q, gate = q_with_gate.split([self.q_size, self.num_heads], dim=-1)
-        # Make tensors contiguous after split to ensure proper memory layout
         q = q.contiguous()
         gate = gate.contiguous()
 
-        # === Project K, V ===
         k, _ = self.k_proj(hidden_states)
         v, _ = self.v_proj(hidden_states)
 
-        # === Apply QK normalization ===
         q, k = self._apply_qk_norm(q, k)
-
-        # === Apply rotary embeddings ===
         q, k = self.rotary_emb(positions, q, k)
 
-        # === Hard gate routing ===
-        gate_sigmoid = torch.sigmoid(gate)  # [num_tokens, num_heads]
+        gate_sigmoid = torch.sigmoid(gate)
         gate_hard = (gate_sigmoid > 0.5).to(hidden_states.dtype)
 
-        # === Global attention (updates KV cache) ===
         global_output = self.global_attn(q, k, v)
-
-        # === Local attention (uses shared KV cache, applies sliding window) ===
-        # Pass None for k, v since we're sharing the KV cache
         local_output = self.local_attn(q, None, None)
 
-        # === Blend outputs per-head ===
         num_tokens = global_output.shape[0]
         global_out = global_output.view(num_tokens, self.num_heads, self.head_dim)
         local_out = local_output.view(num_tokens, self.num_heads, self.head_dim)
-        gate_hard = gate_hard.unsqueeze(-1)  # [num_tokens, num_heads, 1]
+        gate_hard = gate_hard.unsqueeze(-1)
 
-        # gate=1 -> global, gate=0 -> local
         blended = global_out * gate_hard + local_out * (1.0 - gate_hard)
         blended = blended.view(num_tokens, -1)
 
-        # === Output projection ===
         output, _ = self.o_proj(blended)
         return output
 
 
-class Olmo2AHAMLP(nn.Module):
+class _AHARoutedAttention(nn.Module):
     """
-    MLP block (same as standard OLMo2).
+    All-or-Here Attention — per-GQA-group routed decode.
+
+    During decode: iterates over GQA groups, skipping the attention type
+    that no head in the group needs. ~90% of groups route all-local.
+
+    During prefill: full attention only — no gate, no blending.
     """
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+        self.config = vllm_config.model_config.hf_config
+
+        hidden_size = self.config.hidden_size
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.total_num_heads = self.config.num_attention_heads
+
+        assert hidden_size % self.total_num_heads == 0
+        assert self.total_num_heads % self.tp_size == 0
+
+        self.num_heads = self.total_num_heads // self.tp_size
+        self.total_num_kv_heads = (
+            self.config.num_key_value_heads or self.total_num_heads
+        )
+        if self.total_num_kv_heads >= self.tp_size:
+            assert self.total_num_kv_heads % self.tp_size == 0
+        else:
+            assert self.tp_size % self.total_num_kv_heads == 0
+
+        self.num_kv_heads = max(1, self.total_num_kv_heads // self.tp_size)
+        self.head_dim = hidden_size // self.total_num_heads
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+        self.max_position_embeddings = self.config.max_position_embeddings
+        self.scaling = self.head_dim**-0.5
+        self.num_queries_per_kv = self.num_heads // self.num_kv_heads
+        self.local_window_size = getattr(self.config, "local_window_size", 128)
+
+        self.tp_rank = get_tensor_model_parallel_rank()
+
+        self.q_proj = ColumnParallelLinear(
+            hidden_size,
+            self.total_num_heads * self.head_dim + self.total_num_heads,
+            bias=False,
+            quant_config=vllm_config.quant_config,
+            prefix=f"{prefix}.q_proj",
+        )
+        self.k_proj = ColumnParallelLinear(
+            hidden_size,
+            self.total_num_kv_heads * self.head_dim,
+            bias=False,
+            quant_config=vllm_config.quant_config,
+            prefix=f"{prefix}.k_proj",
+        )
+        self.v_proj = ColumnParallelLinear(
+            hidden_size,
+            self.total_num_kv_heads * self.head_dim,
+            bias=False,
+            quant_config=vllm_config.quant_config,
+            prefix=f"{prefix}.v_proj",
+        )
+
+        self.q_norm = RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
+        self.k_norm = RMSNorm(
+            self.total_num_kv_heads * self.head_dim, eps=self.config.rms_norm_eps
+        )
+
+        rope_parameters = self.config.rope_parameters
+        self.rotary_emb = get_rope(
+            self.head_dim,
+            max_position=self.max_position_embeddings,
+            rope_parameters=rope_parameters,
+        )
+
+        # Single Attention layer — owns the KV cache, used for prefill
+        self.kv_cache_attn = Attention(
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            num_kv_heads=self.num_kv_heads,
+            cache_config=vllm_config.cache_config,
+            quant_config=vllm_config.quant_config,
+            per_layer_sliding_window=None,
+            prefix=f"{prefix}.kv_cache_attn",
+        )
+
+        self.o_proj = RowParallelLinear(
+            self.total_num_heads * self.head_dim,
+            hidden_size,
+            bias=False,
+            quant_config=vllm_config.quant_config,
+            prefix=f"{prefix}.o_proj",
+        )
+
+        self._prefix = prefix
+
+    def _apply_qk_norm(
+        self, q: torch.Tensor, k: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.tp_size > 1:
+            q = tensor_model_parallel_all_gather(q.contiguous())
+            k = tensor_model_parallel_all_gather(k.contiguous())
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        if self.tp_size > 1:
+            splitter = partial(
+                split_tensor_along_last_dim, num_partitions=self.tp_size
+            )
+            q = splitter(q)[self.tp_rank].contiguous()
+            k = splitter(k)[self.tp_rank].contiguous()
+        return q, k
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        q_with_gate, _ = self.q_proj(hidden_states)
+        q, gate = q_with_gate.split([self.q_size, self.num_heads], dim=-1)
+        q = q.contiguous()
+        gate = gate.contiguous()
+
+        k, _ = self.k_proj(hidden_states)
+        v, _ = self.v_proj(hidden_states)
+
+        q, k = self._apply_qk_norm(q, k)
+        q, k = self.rotary_emb(positions, q, k)
+
+        attn_metadata, attn_layer, kv_cache = get_attention_context(
+            self.kv_cache_attn.layer_name
+        )
+
+        if attn_metadata is None or attn_metadata.max_query_len > 1:
+            return self._forward_prefill_full(q, k, v)
+        else:
+            gate_sigmoid = torch.sigmoid(gate)
+            gate_hard = (gate_sigmoid > 0.5).to(hidden_states.dtype)
+
+            if _GATE_STATS_ENABLED:
+                self._log_gate_stats(gate_hard)
+
+            return self._forward_decode_routed(
+                q, k, v, gate_hard, attn_metadata, attn_layer, kv_cache
+            )
+
+    def _forward_prefill_full(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> torch.Tensor:
+        attn_output = self.kv_cache_attn(q, k, v)
+        output, _ = self.o_proj(attn_output)
+        return output
+
+    @torch.compiler.disable
+    def _forward_decode_routed(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        gate_hard: torch.Tensor,
+        attn_metadata,
+        attn_layer,
+        kv_cache: torch.Tensor,
+    ) -> torch.Tensor:
+        global _routed_timing_stats, _routed_timing_totals, _routed_timing_count
+        global _all_local_groups, _all_global_groups, _mixed_groups
+
+        N = q.shape[0]
+        q = q.view(N, self.num_heads, self.head_dim)
+        k = k.view(N, self.num_kv_heads, self.head_dim)
+        v = v.view(N, self.num_kv_heads, self.head_dim)
+
+        # Phase 1: KV cache update
+        forward_ctx = get_forward_context()
+        slot_mapping = forward_ctx.slot_mapping
+        if isinstance(slot_mapping, dict):
+            layer_slot_mapping = slot_mapping.get(self.kv_cache_attn.layer_name)
+        else:
+            layer_slot_mapping = slot_mapping
+
+        key_cache, value_cache = kv_cache.unbind(0)
+
+        if layer_slot_mapping is not None:
+            if _TIMING_ENABLED:
+                _t0s = torch.cuda.Event(enable_timing=True)
+                _t0e = torch.cuda.Event(enable_timing=True)
+                _t0s.record()
+            reshape_and_cache_flash(
+                k, v,
+                key_cache, value_cache,
+                layer_slot_mapping,
+                attn_layer.kv_cache_dtype,
+                attn_layer._k_scale,
+                attn_layer._v_scale,
+            )
+            if _TIMING_ENABLED:
+                _t0e.record()
+
+        # Phase 2: Per-GQA-group routed attention
+        fa_version = attn_layer.impl.vllm_flash_attn_version
+
+        if attn_layer.kv_cache_dtype.startswith("fp8"):
+            from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
+            fp8_dtype = FlashAttentionBackend.get_fp8_dtype_for_flashattn(
+                attn_layer.kv_cache_dtype
+            )
+            key_cache = key_cache.view(fp8_dtype)
+            value_cache = value_cache.view(fp8_dtype)
+
+        output = torch.empty(
+            N, self.num_heads, self.head_dim, dtype=q.dtype, device=q.device,
+        )
+
+        if _TIMING_ENABLED:
+            _local_ms = 0.0
+            _global_ms = 0.0
+            _n_local = _n_global = _n_mixed = 0
+
+        for g in range(self.num_kv_heads):
+            q_start = g * self.num_queries_per_kv
+            q_end = q_start + self.num_queries_per_kv
+
+            q_group = q[:, q_start:q_end, :].contiguous()
+            group_gate = gate_hard[:, q_start:q_end]
+
+            has_any_global = group_gate.any().item()
+            has_any_local = (~group_gate.bool()).any().item()
+
+            k_cache_g = key_cache[:, :, g:g+1, :].contiguous()
+            v_cache_g = value_cache[:, :, g:g+1, :].contiguous()
+
+            descale_shape = (attn_metadata.query_start_loc.shape[0] - 1, 1)
+            q_descale = attn_layer._q_scale.expand(descale_shape)
+            k_descale = attn_layer._k_scale.expand(descale_shape)
+            v_descale = attn_layer._v_scale.expand(descale_shape)
+
+            if has_any_global and not has_any_local:
+                if _TIMING_ENABLED:
+                    _n_global += 1
+                    _ts = torch.cuda.Event(enable_timing=True)
+                    _te = torch.cuda.Event(enable_timing=True)
+                    _ts.record()
+                group_out = torch.empty(
+                    N, self.num_queries_per_kv, self.head_dim,
+                    dtype=q.dtype, device=q.device,
+                )
+                flash_attn_varlen_func(
+                    q=q_group, k=k_cache_g, v=v_cache_g, out=group_out,
+                    cu_seqlens_q=attn_metadata.query_start_loc,
+                    max_seqlen_q=attn_metadata.max_query_len,
+                    seqused_k=attn_metadata.seq_lens,
+                    max_seqlen_k=attn_metadata.max_seq_len,
+                    softmax_scale=self.scaling, causal=True,
+                    window_size=[-1, -1],
+                    block_table=attn_metadata.block_table,
+                    fa_version=fa_version,
+                    q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
+                )
+                if _TIMING_ENABLED:
+                    _te.record()
+                    torch.cuda.synchronize()
+                    _global_ms += _ts.elapsed_time(_te)
+                output[:, q_start:q_end, :] = group_out
+
+            elif not has_any_global and has_any_local:
+                if _TIMING_ENABLED:
+                    _n_local += 1
+                    _ts = torch.cuda.Event(enable_timing=True)
+                    _te = torch.cuda.Event(enable_timing=True)
+                    _ts.record()
+                group_out = torch.empty(
+                    N, self.num_queries_per_kv, self.head_dim,
+                    dtype=q.dtype, device=q.device,
+                )
+                flash_attn_varlen_func(
+                    q=q_group, k=k_cache_g, v=v_cache_g, out=group_out,
+                    cu_seqlens_q=attn_metadata.query_start_loc,
+                    max_seqlen_q=attn_metadata.max_query_len,
+                    seqused_k=attn_metadata.seq_lens,
+                    max_seqlen_k=attn_metadata.max_seq_len,
+                    softmax_scale=self.scaling, causal=True,
+                    window_size=[self.local_window_size - 1, 0],
+                    block_table=attn_metadata.block_table,
+                    fa_version=fa_version,
+                    q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
+                )
+                if _TIMING_ENABLED:
+                    _te.record()
+                    torch.cuda.synchronize()
+                    _local_ms += _ts.elapsed_time(_te)
+                output[:, q_start:q_end, :] = group_out
+
+            else:
+                if _TIMING_ENABLED:
+                    _n_mixed += 1
+                    _tgs = torch.cuda.Event(enable_timing=True)
+                    _tge = torch.cuda.Event(enable_timing=True)
+                    _tls = torch.cuda.Event(enable_timing=True)
+                    _tle = torch.cuda.Event(enable_timing=True)
+                global_out = torch.empty(
+                    N, self.num_queries_per_kv, self.head_dim,
+                    dtype=q.dtype, device=q.device,
+                )
+                local_out = torch.empty(
+                    N, self.num_queries_per_kv, self.head_dim,
+                    dtype=q.dtype, device=q.device,
+                )
+                if _TIMING_ENABLED:
+                    _tgs.record()
+                flash_attn_varlen_func(
+                    q=q_group, k=k_cache_g, v=v_cache_g, out=global_out,
+                    cu_seqlens_q=attn_metadata.query_start_loc,
+                    max_seqlen_q=attn_metadata.max_query_len,
+                    seqused_k=attn_metadata.seq_lens,
+                    max_seqlen_k=attn_metadata.max_seq_len,
+                    softmax_scale=self.scaling, causal=True,
+                    window_size=[-1, -1],
+                    block_table=attn_metadata.block_table,
+                    fa_version=fa_version,
+                    q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
+                )
+                if _TIMING_ENABLED:
+                    _tge.record()
+                    _tls.record()
+                flash_attn_varlen_func(
+                    q=q_group, k=k_cache_g, v=v_cache_g, out=local_out,
+                    cu_seqlens_q=attn_metadata.query_start_loc,
+                    max_seqlen_q=attn_metadata.max_query_len,
+                    seqused_k=attn_metadata.seq_lens,
+                    max_seqlen_k=attn_metadata.max_seq_len,
+                    softmax_scale=self.scaling, causal=True,
+                    window_size=[self.local_window_size - 1, 0],
+                    block_table=attn_metadata.block_table,
+                    fa_version=fa_version,
+                    q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
+                )
+                if _TIMING_ENABLED:
+                    _tle.record()
+                    torch.cuda.synchronize()
+                    _global_ms += _tgs.elapsed_time(_tge)
+                    _local_ms += _tls.elapsed_time(_tle)
+
+                gate_expanded = group_gate.unsqueeze(-1).to(q.dtype)
+                output[:, q_start:q_end, :] = (
+                    global_out * gate_expanded + local_out * (1.0 - gate_expanded)
+                )
+
+        if _TIMING_ENABLED:
+            torch.cuda.synchronize()
+            kv_ms = _t0s.elapsed_time(_t0e) if layer_slot_mapping is not None else 0.0
+            self._accumulate_routed_timing(
+                kv_ms, _local_ms, _global_ms, _n_local, _n_global, _n_mixed
+            )
+
+        attn_output = output.view(N, -1)
+        output_final, _ = self.o_proj(attn_output)
+        return output_final
+
+    def _accumulate_routed_timing(
+        self,
+        kv_ms: float,
+        local_ms: float,
+        global_ms: float,
+        n_local: int,
+        n_global: int,
+        n_mixed: int,
+    ) -> None:
+        global _routed_timing_stats, _routed_timing_totals, _routed_timing_count
+        global _all_local_groups, _all_global_groups, _mixed_groups
+
+        _routed_timing_stats["kv_update"] += kv_ms
+        _routed_timing_stats["local_attn"] += local_ms
+        _routed_timing_stats["global_attn"] += global_ms
+
+        _routed_timing_totals["kv_update"] += kv_ms
+        _routed_timing_totals["local_attn"] += local_ms
+        _routed_timing_totals["global_attn"] += global_ms
+
+        _all_local_groups += n_local
+        _all_global_groups += n_global
+        _mixed_groups += n_mixed
+        _routed_timing_count += 1
+
+        if _routed_timing_count % _TIMING_LOG_INTERVAL == 0:
+            n = _TIMING_LOG_INTERVAL
+            kv_avg = _routed_timing_stats["kv_update"] / n
+            local_avg = _routed_timing_stats["local_attn"] / n
+            glob_avg = _routed_timing_stats["global_attn"] / n
+            total_ms = kv_avg + local_avg + glob_avg
+            logger.info(
+                "Timing [%s] step=%d (avg over %d decode calls): "
+                "kv_update=%.3f ms (%.1f%%), "
+                "local_attn=%.3f ms (%.1f%%), "
+                "global_attn=%.3f ms (%.1f%%), "
+                "total=%.3f ms",
+                self._prefix, _routed_timing_count, n,
+                kv_avg, 100 * kv_avg / total_ms if total_ms else 0,
+                local_avg, 100 * local_avg / total_ms if total_ms else 0,
+                glob_avg, 100 * glob_avg / total_ms if total_ms else 0,
+                total_ms,
+            )
+            _routed_timing_stats["kv_update"] = 0.0
+            _routed_timing_stats["local_attn"] = 0.0
+            _routed_timing_stats["global_attn"] = 0.0
+
+            try:
+                total_groups = _all_local_groups + _all_global_groups + _mixed_groups
+                with open(_TIMING_OUTPUT_FILE_ROUTED, "w") as _f:
+                    json.dump({
+                        "totals": _routed_timing_totals,
+                        "count": _routed_timing_count,
+                        "all_local_groups": _all_local_groups,
+                        "all_global_groups": _all_global_groups,
+                        "mixed_groups": _mixed_groups,
+                        "total_groups": total_groups,
+                        "num_kv_heads": self.num_kv_heads,
+                    }, _f)
+            except OSError:
+                pass
+
+    def _log_gate_stats(self, gate_hard: torch.Tensor) -> None:
+        global _gate_stats_counter
+        _gate_stats_counter += 1
+        if _gate_stats_counter % _GATE_STATS_INTERVAL != 0:
+            return
+
+        N, H = gate_hard.shape
+        gate_by_group = gate_hard.view(N, self.num_kv_heads, self.num_queries_per_kv)
+
+        all_global_count = all_local_count = mixed_count = 0
+        for g in range(self.num_kv_heads):
+            group_gate = gate_by_group[:, g, :]
+            has_any_global = group_gate.any().item()
+            has_any_local = (~group_gate.bool()).any().item()
+            if has_any_global and not has_any_local:
+                all_global_count += 1
+            elif not has_any_global and has_any_local:
+                all_local_count += 1
+            else:
+                mixed_count += 1
+
+        logger.info(
+            "Gate stats [%s] step=%d: "
+            "all_local=%d (%.1f%%), all_global=%d (%.1f%%), mixed=%d (%.1f%%)",
+            self._prefix, _gate_stats_counter,
+            all_local_count, all_local_count / self.num_kv_heads * 100,
+            all_global_count, all_global_count / self.num_kv_heads * 100,
+            mixed_count, mixed_count / self.num_kv_heads * 100,
+        )
+
+
+class _AHAGreedyAttention(nn.Module):
+    """
+    All-or-Here Attention — greedy local-first decode.
+
+    During decode: computes local attention for ALL heads in one kernel call,
+    then runs global attention only for the ~10% of GQA groups that need it
+    (1-2 kernel calls total).
+
+    During prefill: full attention only — no gate, no blending.
+    """
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__()
+        self.config = vllm_config.model_config.hf_config
+
+        hidden_size = self.config.hidden_size
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.total_num_heads = self.config.num_attention_heads
+
+        assert hidden_size % self.total_num_heads == 0
+        assert self.total_num_heads % self.tp_size == 0
+
+        self.num_heads = self.total_num_heads // self.tp_size
+        self.total_num_kv_heads = (
+            self.config.num_key_value_heads or self.total_num_heads
+        )
+        if self.total_num_kv_heads >= self.tp_size:
+            assert self.total_num_kv_heads % self.tp_size == 0
+        else:
+            assert self.tp_size % self.total_num_kv_heads == 0
+
+        self.num_kv_heads = max(1, self.total_num_kv_heads // self.tp_size)
+        self.head_dim = hidden_size // self.total_num_heads
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+        self.max_position_embeddings = self.config.max_position_embeddings
+        self.scaling = self.head_dim**-0.5
+        self.num_queries_per_kv = self.num_heads // self.num_kv_heads
+        self.local_window_size = getattr(self.config, "local_window_size", 128)
+
+        self.tp_rank = get_tensor_model_parallel_rank()
+
+        self.q_proj = ColumnParallelLinear(
+            hidden_size,
+            self.total_num_heads * self.head_dim + self.total_num_heads,
+            bias=False,
+            quant_config=vllm_config.quant_config,
+            prefix=f"{prefix}.q_proj",
+        )
+        self.k_proj = ColumnParallelLinear(
+            hidden_size,
+            self.total_num_kv_heads * self.head_dim,
+            bias=False,
+            quant_config=vllm_config.quant_config,
+            prefix=f"{prefix}.k_proj",
+        )
+        self.v_proj = ColumnParallelLinear(
+            hidden_size,
+            self.total_num_kv_heads * self.head_dim,
+            bias=False,
+            quant_config=vllm_config.quant_config,
+            prefix=f"{prefix}.v_proj",
+        )
+
+        self.q_norm = RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
+        self.k_norm = RMSNorm(
+            self.total_num_kv_heads * self.head_dim, eps=self.config.rms_norm_eps
+        )
+
+        rope_parameters = self.config.rope_parameters
+        self.rotary_emb = get_rope(
+            self.head_dim,
+            max_position=self.max_position_embeddings,
+            rope_parameters=rope_parameters,
+        )
+
+        self.kv_cache_attn = Attention(
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            num_kv_heads=self.num_kv_heads,
+            cache_config=vllm_config.cache_config,
+            quant_config=vllm_config.quant_config,
+            per_layer_sliding_window=None,
+            prefix=f"{prefix}.kv_cache_attn",
+        )
+
+        self.o_proj = RowParallelLinear(
+            self.total_num_heads * self.head_dim,
+            hidden_size,
+            bias=False,
+            quant_config=vllm_config.quant_config,
+            prefix=f"{prefix}.o_proj",
+        )
+
+        self._prefix = prefix
+
+    def _apply_qk_norm(
+        self, q: torch.Tensor, k: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.tp_size > 1:
+            q = tensor_model_parallel_all_gather(q.contiguous())
+            k = tensor_model_parallel_all_gather(k.contiguous())
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        if self.tp_size > 1:
+            splitter = partial(
+                split_tensor_along_last_dim, num_partitions=self.tp_size
+            )
+            q = splitter(q)[self.tp_rank].contiguous()
+            k = splitter(k)[self.tp_rank].contiguous()
+        return q, k
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        q_with_gate, _ = self.q_proj(hidden_states)
+        q, gate = q_with_gate.split([self.q_size, self.num_heads], dim=-1)
+        q = q.contiguous()
+        gate = gate.contiguous()
+
+        k, _ = self.k_proj(hidden_states)
+        v, _ = self.v_proj(hidden_states)
+
+        q, k = self._apply_qk_norm(q, k)
+        q, k = self.rotary_emb(positions, q, k)
+
+        attn_metadata, attn_layer, kv_cache = get_attention_context(
+            self.kv_cache_attn.layer_name
+        )
+
+        if attn_metadata is None or attn_metadata.max_query_len > 1:
+            return self._forward_prefill_full(q, k, v)
+        else:
+            gate_sigmoid = torch.sigmoid(gate)
+            gate_hard = (gate_sigmoid > 0.5).to(hidden_states.dtype)
+
+            if _GATE_STATS_ENABLED:
+                self._log_gate_stats(gate_hard)
+
+            return self._forward_decode_greedy(
+                q, k, v, gate_hard, attn_metadata, attn_layer, kv_cache
+            )
+
+    def _forward_prefill_full(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> torch.Tensor:
+        attn_output = self.kv_cache_attn(q, k, v)
+        output, _ = self.o_proj(attn_output)
+        return output
+
+    def _forward_decode_greedy(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        gate_hard: torch.Tensor,
+        attn_metadata,
+        attn_layer,
+        kv_cache: torch.Tensor,
+    ) -> torch.Tensor:
+        global _timing_stats, _timing_totals, _timing_count
+        global _local_only_calls, _global_calls, _total_global_groups
+
+        N = q.shape[0]
+        q = q.view(N, self.num_heads, self.head_dim)
+        k = k.view(N, self.num_kv_heads, self.head_dim)
+        v = v.view(N, self.num_kv_heads, self.head_dim)
+
+        if _TIMING_ENABLED:
+            t0_start = torch.cuda.Event(enable_timing=True)
+            t0_end = torch.cuda.Event(enable_timing=True)
+            t1_start = torch.cuda.Event(enable_timing=True)
+            t1_end = torch.cuda.Event(enable_timing=True)
+            t3_start = torch.cuda.Event(enable_timing=True)
+            t3_end = torch.cuda.Event(enable_timing=True)
+
+        # Phase 0: KV cache update
+        forward_ctx = get_forward_context()
+        slot_mapping = forward_ctx.slot_mapping
+        if isinstance(slot_mapping, dict):
+            layer_slot_mapping = slot_mapping.get(self.kv_cache_attn.layer_name)
+        else:
+            layer_slot_mapping = slot_mapping
+
+        key_cache, value_cache = kv_cache.unbind(0)
+
+        if layer_slot_mapping is not None:
+            if _TIMING_ENABLED:
+                t0_start.record()
+            reshape_and_cache_flash(
+                k, v,
+                key_cache, value_cache,
+                layer_slot_mapping,
+                attn_layer.kv_cache_dtype,
+                attn_layer._k_scale,
+                attn_layer._v_scale,
+            )
+            if _TIMING_ENABLED:
+                t0_end.record()
+
+        fa_version = attn_layer.impl.vllm_flash_attn_version
+
+        if attn_layer.kv_cache_dtype.startswith("fp8"):
+            from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
+            fp8_dtype = FlashAttentionBackend.get_fp8_dtype_for_flashattn(
+                attn_layer.kv_cache_dtype
+            )
+            key_cache = key_cache.view(fp8_dtype)
+            value_cache = value_cache.view(fp8_dtype)
+
+        descale_shape = (
+            attn_metadata.query_start_loc.shape[0] - 1,
+            self.num_kv_heads,
+        )
+        q_descale = attn_layer._q_scale.expand(descale_shape)
+        k_descale = attn_layer._k_scale.expand(descale_shape)
+        v_descale = attn_layer._v_scale.expand(descale_shape)
+
+        # Phase 1: Local attention for ALL heads (1 kernel call)
+        output = torch.empty(
+            N, self.num_heads, self.head_dim, dtype=q.dtype, device=q.device,
+        )
+
+        if _TIMING_ENABLED:
+            t1_start.record()
+        flash_attn_varlen_func(
+            q=q, k=key_cache, v=value_cache, out=output,
+            cu_seqlens_q=attn_metadata.query_start_loc,
+            max_seqlen_q=attn_metadata.max_query_len,
+            seqused_k=attn_metadata.seq_lens,
+            max_seqlen_k=attn_metadata.max_seq_len,
+            softmax_scale=self.scaling, causal=True,
+            window_size=[self.local_window_size - 1, 0],
+            block_table=attn_metadata.block_table,
+            fa_version=fa_version,
+            q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
+        )
+        if _TIMING_ENABLED:
+            t1_end.record()
+
+        # Phase 2: Identify GQA groups needing global attention
+        gate_by_group = gate_hard.view(N, self.num_kv_heads, self.num_queries_per_kv)
+        group_needs_global = gate_by_group.any(dim=0).any(dim=-1)
+        global_group_indices = group_needs_global.nonzero(as_tuple=False).squeeze(-1)
+
+        if _TIMING_ENABLED:
+            n_global = global_group_indices.numel()
+            if n_global > 0:
+                _global_calls += 1
+                _total_global_groups += n_global
+            else:
+                _local_only_calls += 1
+
+        # Phase 3: Global attention for subset (0 or 1 kernel call)
+        if _TIMING_ENABLED:
+            t3_start.record()
+
+        if global_group_indices.numel() > 0:
+            num_global_kv = global_group_indices.numel()
+            nqpkv = self.num_queries_per_kv
+            q_head_indices = torch.cat([
+                torch.arange(g * nqpkv, (g + 1) * nqpkv, device=q.device)
+                for g in global_group_indices
+            ])
+
+            q_global = q[:, q_head_indices, :].contiguous()
+            k_global = key_cache[:, :, global_group_indices, :].contiguous()
+            v_global = value_cache[:, :, global_group_indices, :].contiguous()
+
+            global_output = torch.empty(
+                N, q_head_indices.numel(), self.head_dim,
+                dtype=q.dtype, device=q.device,
+            )
+
+            global_descale_shape = (
+                attn_metadata.query_start_loc.shape[0] - 1,
+                num_global_kv,
+            )
+            q_descale_g = attn_layer._q_scale.expand(global_descale_shape)
+            k_descale_g = attn_layer._k_scale.expand(global_descale_shape)
+            v_descale_g = attn_layer._v_scale.expand(global_descale_shape)
+
+            flash_attn_varlen_func(
+                q=q_global, k=k_global, v=v_global, out=global_output,
+                cu_seqlens_q=attn_metadata.query_start_loc,
+                max_seqlen_q=attn_metadata.max_query_len,
+                seqused_k=attn_metadata.seq_lens,
+                max_seqlen_k=attn_metadata.max_seq_len,
+                softmax_scale=self.scaling, causal=True,
+                window_size=[-1, -1],
+                block_table=attn_metadata.block_table,
+                fa_version=fa_version,
+                q_descale=q_descale_g, k_descale=k_descale_g,
+                v_descale=v_descale_g,
+            )
+
+            gate_expanded = gate_hard[:, q_head_indices].unsqueeze(-1)
+            output[:, q_head_indices, :] = (
+                gate_expanded * global_output
+                + (1.0 - gate_expanded) * output[:, q_head_indices, :]
+            )
+
+        if _TIMING_ENABLED:
+            t3_end.record()
+            self._accumulate_greedy_timing(
+                t0_start, t0_end, t1_start, t1_end, t3_start, t3_end,
+                layer_slot_mapping is not None,
+            )
+
+        attn_output = output.view(N, -1)
+        output_final, _ = self.o_proj(attn_output)
+        return output_final
+
+    def _accumulate_greedy_timing(
+        self,
+        t0_start, t0_end,
+        t1_start, t1_end,
+        t3_start, t3_end,
+        has_kv_update: bool,
+    ) -> None:
+        global _timing_stats, _timing_totals, _timing_count
+        torch.cuda.synchronize()
+        kv_ms = t0_start.elapsed_time(t0_end) if has_kv_update else 0.0
+        local_ms = t1_start.elapsed_time(t1_end)
+        global_ms = t3_start.elapsed_time(t3_end)
+
+        _timing_stats["kv_update"] += kv_ms
+        _timing_stats["local_attn"] += local_ms
+        _timing_stats["global_attn"] += global_ms
+
+        _timing_totals["kv_update"] += kv_ms
+        _timing_totals["local_attn"] += local_ms
+        _timing_totals["global_attn"] += global_ms
+
+        _timing_count += 1
+
+        if _timing_count % _TIMING_LOG_INTERVAL == 0:
+            n = _TIMING_LOG_INTERVAL
+            kv_avg = _timing_stats["kv_update"] / n
+            local_avg = _timing_stats["local_attn"] / n
+            glob_avg = _timing_stats["global_attn"] / n
+            total_ms = kv_avg + local_avg + glob_avg
+            logger.info(
+                "Timing [%s] step=%d (avg over %d decode calls): "
+                "kv_update=%.3f ms (%.1f%%), "
+                "local_attn=%.3f ms (%.1f%%), "
+                "global_attn=%.3f ms (%.1f%%), "
+                "total=%.3f ms",
+                self._prefix, _timing_count, n,
+                kv_avg, 100 * kv_avg / total_ms if total_ms else 0,
+                local_avg, 100 * local_avg / total_ms if total_ms else 0,
+                glob_avg, 100 * glob_avg / total_ms if total_ms else 0,
+                total_ms,
+            )
+            _timing_stats["kv_update"] = 0.0
+            _timing_stats["local_attn"] = 0.0
+            _timing_stats["global_attn"] = 0.0
+
+            try:
+                with open(_TIMING_OUTPUT_FILE_GREEDY, "w") as _f:
+                    json.dump({
+                        "totals": _timing_totals,
+                        "count": _timing_count,
+                        "local_only_calls": _local_only_calls,
+                        "global_calls": _global_calls,
+                        "total_global_groups": _total_global_groups,
+                        "num_kv_heads": self.num_kv_heads,
+                    }, _f)
+            except OSError:
+                pass
+
+    def _log_gate_stats(self, gate_hard: torch.Tensor) -> None:
+        global _gate_stats_counter
+        _gate_stats_counter += 1
+        if _gate_stats_counter % _GATE_STATS_INTERVAL != 0:
+            return
+
+        N, H = gate_hard.shape
+        gate_by_group = gate_hard.view(N, self.num_kv_heads, self.num_queries_per_kv)
+
+        all_global_count = all_local_count = mixed_count = 0
+        for g in range(self.num_kv_heads):
+            group_gate = gate_by_group[:, g, :]
+            has_any_global = group_gate.any().item()
+            has_any_local = (~group_gate.bool()).any().item()
+            if has_any_global and not has_any_local:
+                all_global_count += 1
+            elif not has_any_global and has_any_local:
+                all_local_count += 1
+            else:
+                mixed_count += 1
+
+        group_needs_global = gate_by_group.any(dim=0).any(dim=-1)
+        num_global_groups = group_needs_global.sum().item()
+
+        logger.info(
+            "Gate stats [%s] step=%d: "
+            "all_local=%d (%.1f%%), all_global=%d (%.1f%%), mixed=%d (%.1f%%), "
+            "global_kernel_groups=%d/%d",
+            self._prefix, _gate_stats_counter,
+            all_local_count, all_local_count / self.num_kv_heads * 100,
+            all_global_count, all_global_count / self.num_kv_heads * 100,
+            mixed_count, mixed_count / self.num_kv_heads * 100,
+            num_global_groups, self.num_kv_heads,
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Dispatch table
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_ATTENTION_IMPLEMENTATIONS: dict[str, type[nn.Module]] = {
+    "dual":     _AHADualAttention,
+    "baseline": _AHADualAttention,   # same impl, used as frozen reference
+    "routed":   _AHARoutedAttention,
+    "greedy":   _AHAGreedyAttention,
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Shared model components (single copy used by all variants)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class FAOlmoMLP(nn.Module):
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__()
         config = vllm_config.model_config.hf_config
-        # FAOlmo uses a custom config
-        # assert isinstance(config, Olmo2Config)
         hidden_size = config.hidden_size
         intermediate_size = config.intermediate_size
 
-        # Feed-forward input projection
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
@@ -259,11 +1161,7 @@ class Olmo2AHAMLP(nn.Module):
             quant_config=vllm_config.quant_config,
             prefix=f"{prefix}.gate_up_proj",
         )
-
-        # Activation function
         self.act_fn = SiluAndMul()
-
-        # Feed-forward output projection
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
@@ -279,26 +1177,22 @@ class Olmo2AHAMLP(nn.Module):
         return x
 
 
-class Olmo2AHADecoderLayer(nn.Module):
-    """
-    Transformer decoder layer with AHA attention.
-    """
-
+class FAOlmoDecoderLayer(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_config
-        # FAOlmo uses a custom config
-        # assert isinstance(config, Olmo2Config)
 
-        # AHA Attention block
-        self.self_attn = Olmo2AHAAttention(
+        impl = getattr(config, "attention_implementation", "greedy")
+        if impl not in _ATTENTION_IMPLEMENTATIONS:
+            raise ValueError(
+                f"Unknown AHA attention_implementation: {impl!r}. "
+                f"Choose from {list(_ATTENTION_IMPLEMENTATIONS)}"
+            )
+        self.self_attn = _ATTENTION_IMPLEMENTATIONS[impl](
             vllm_config=vllm_config, prefix=f"{prefix}.self_attn"
         )
 
-        # MLP block
-        self.mlp = Olmo2AHAMLP(vllm_config=vllm_config, prefix=f"{prefix}.mlp")
-
-        # LayerNorm
+        self.mlp = FAOlmoMLP(vllm_config=vllm_config, prefix=f"{prefix}.mlp")
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
@@ -311,13 +1205,11 @@ class Olmo2AHADecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        # Attention block
         residual = hidden_states
         hidden_states = self.self_attn(positions, hidden_states)
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = hidden_states + residual
 
-        # MLP block
         residual = hidden_states
         hidden_states = self.mlp(hidden_states)
         hidden_states = self.post_feedforward_layernorm(hidden_states)
@@ -326,16 +1218,10 @@ class Olmo2AHADecoderLayer(nn.Module):
 
 
 @support_torch_compile
-class Olmo2AHAModel(nn.Module):
-    """
-    OLMo2-AHA model backbone.
-    """
-
+class FAOlmoModel(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
-        # FAOlmo uses a custom config, not Olmo2Config
-        # assert isinstance(self.config, Olmo2Config)
 
         self.embed_tokens = VocabParallelEmbedding(
             self.config.vocab_size,
@@ -344,15 +1230,10 @@ class Olmo2AHAModel(nn.Module):
         )
         self.start_layer, self.end_layer, self.layers = make_layers(
             self.config.num_hidden_layers,
-            lambda prefix: Olmo2AHADecoderLayer(
-                vllm_config=vllm_config, prefix=prefix
-            ),
+            lambda prefix: FAOlmoDecoderLayer(vllm_config=vllm_config, prefix=prefix),
             prefix=f"{prefix}.layers",
         )
-        self.norm = RMSNorm(
-            self.config.hidden_size,
-            eps=self.config.rms_norm_eps,
-        )
+        self.norm = RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states"], self.config.hidden_size
         )
@@ -377,22 +1258,17 @@ class Olmo2AHAModel(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             assert isinstance(hidden_states, torch.Tensor)
 
-        # Apply decoder layers
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states = layer(positions, hidden_states)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
 
-        # Apply final layer norm
         hidden_states = self.norm(hidden_states)
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # FAOlmo uses separate Q, K, V projections (not fused QKV)
-        # Only MLP gate_up_proj needs stacking
         stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
@@ -404,7 +1280,6 @@ class Olmo2AHAModel(nn.Module):
             if is_pp_missing_parameter(name, self):
                 continue
 
-            # Check for stacked params (MLP gate_up_proj)
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
@@ -416,7 +1291,6 @@ class Olmo2AHAModel(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                # Direct loading for Q, K, V, O projections and norms
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 if name not in params_dict:
@@ -429,26 +1303,22 @@ class Olmo2AHAModel(nn.Module):
         return loaded_params
 
 
-class Olmo2AHAForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
-    """
-    OLMo2 with All-or-Here Attention (AHA) for causal language modeling.
+class FAOlmoForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
+    """FAOlmo (AHA) for causal language modeling.
+
+    The attention implementation is selected from
+    config.attention_implementation: "dual" | "routed" | "greedy" | "baseline".
     """
 
-    # No QKV fusion for AHA - only MLP gate_up_proj is packed
     packed_modules_mapping = {
-        "gate_up_proj": [
-            "gate_proj",
-            "up_proj",
-        ],
+        "gate_up_proj": ["gate_proj", "up_proj"],
     }
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_config
-        # FAOlmo uses a custom config
-        # assert isinstance(config, Olmo2Config)
         self.config = config
-        self.model = Olmo2AHAModel(
+        self.model = FAOlmoModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
         if config.tie_word_embeddings:

@@ -39,8 +39,8 @@ from pathlib import Path
 # Standard OLMo2 (no AHA)
 OLMO2_MODEL = "allenai/OLMo-2-0425-1B"
 
-# AHA model (same HuggingFace repo for both baseline and optimized)
-# The difference is controlled by VLLM_AHA_BASELINE env var
+# AHA model — all four variants use the same checkpoint, selected via
+# --hf-overrides '{"attention_implementation": "..."}' at runtime.
 AHA_MODEL = "xuan-luo/AHA-OLMO2"
 
 # Local-only model (same as OLMo2, but uses local-only implementation)
@@ -105,33 +105,29 @@ def run_benchmark(
     if use_local_only:
         print(f"Using: olmo2_local_only.py (all sliding window)")
     elif use_baseline:
-        print(f"Using: olmo2_aha_baseline.py (frozen)")
+        print(f"Using: olmo2_aha.py impl=baseline (frozen reference)")
     elif use_greedy:
-        print(f"Using: olmo2_aha_greedy.py (greedy local-first)")
+        print(f"Using: olmo2_aha.py impl=greedy (greedy local-first)")
     elif use_routed:
-        print(f"Using: olmo2_aha_routed.py (per-head routed)")
+        print(f"Using: olmo2_aha.py impl=routed (per-head routed)")
     elif "AHA" in model.upper():
-        print(f"Using: olmo2_aha.py (optimized)")
+        print(f"Using: olmo2_aha.py impl=dual (optimized)")
     print(f"{'=' * 70}\n")
 
-    # Set environment for baseline vs optimized vs routed vs greedy vs local-only
+    # Set environment for local-only (still uses env var); AHA variants use
+    # --hf-overrides to set attention_implementation in the config.
     env = os.environ.copy()
-    # Clear all variant flags first
-    for flag in (
-        "VLLM_AHA_BASELINE",
-        "VLLM_AHA_ROUTED",
-        "VLLM_AHA_GREEDY",
-        "VLLM_LOCAL_ONLY",
-    ):
-        env.pop(flag, None)
+    env.pop("VLLM_LOCAL_ONLY", None)
     if use_local_only:
         env["VLLM_LOCAL_ONLY"] = "1"
     elif use_baseline:
-        env["VLLM_AHA_BASELINE"] = "1"
+        cmd += ["--hf-overrides", '{"attention_implementation": "baseline"}']
     elif use_greedy:
-        env["VLLM_AHA_GREEDY"] = "1"
+        cmd += ["--hf-overrides", '{"attention_implementation": "greedy"}']
     elif use_routed:
-        env["VLLM_AHA_ROUTED"] = "1"
+        cmd += ["--hf-overrides", '{"attention_implementation": "routed"}']
+    else:
+        cmd += ["--hf-overrides", '{"attention_implementation": "dual"}']
 
     try:
         result = subprocess.run(
@@ -508,11 +504,11 @@ def main():
     print(f"\nModels:")
     print(f"  1. OLMo2 (baseline)    - Standard OLMo2 without AHA (lower bound)")
     print(
-        f"  2. AHA (baseline)      - Frozen AHA implementation (olmo2_aha_baseline.py)"
+        f"  2. AHA (baseline)      - Frozen AHA reference (olmo2_aha.py impl=baseline)"
     )
-    print(f"  3. AHA (optimized)     - Your optimized AHA (olmo2_aha.py)")
-    print(f"  4. AHA (routed)        - Per-head routed AHA (olmo2_aha_routed.py)")
-    print(f"  5. AHA (greedy)        - Greedy local-first AHA (olmo2_aha_greedy.py)")
+    print(f"  3. AHA (optimized)     - Dual-kernel AHA (olmo2_aha.py impl=dual)")
+    print(f"  4. AHA (routed)        - Per-head routed AHA (olmo2_aha.py impl=routed)")
+    print(f"  5. AHA (greedy)        - Greedy local-first AHA (olmo2_aha.py impl=greedy)")
     print(f"  6. Local-only (upper)  - All sliding window attention (upper bound)")
 
     olmo2_results = {}

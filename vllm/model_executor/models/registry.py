@@ -170,14 +170,7 @@ _TEXT_GENERATION_MODELS = {
         if os.environ.get("VLLM_LOCAL_ONLY")
         else ("olmo2", "Olmo2ForCausalLM"),
     "Olmo3ForCausalLM": ("olmo2", "Olmo2ForCausalLM"),
-    # FAOlmo: Use VLLM_AHA_BASELINE=1 env var to use baseline implementation
-    "FAOlmoForCausalLM": ("olmo2_aha_baseline", "Olmo2AHABaselineForCausalLM")
-        if os.environ.get("VLLM_AHA_BASELINE")
-        else ("olmo2_aha_greedy", "Olmo2AHAGreedyForCausalLM")
-        if os.environ.get("VLLM_AHA_GREEDY")
-        else ("olmo2_aha_routed", "Olmo2AHARoutedForCausalLM")
-        if os.environ.get("VLLM_AHA_ROUTED")
-        else ("olmo2_aha", "Olmo2AHAForCausalLM"),
+    "FAOlmoForCausalLM": ("olmo2_aha", "FAOlmoForCausalLM"),
     "OlmoeForCausalLM": ("olmoe", "OlmoeForCausalLM"),
     "OPTForCausalLM": ("opt", "OPTForCausalLM"),
     "OrionForCausalLM": ("orion", "OrionForCausalLM"),
