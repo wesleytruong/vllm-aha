@@ -1,29 +1,31 @@
 #!/usr/bin/env python3
 """
-Benchmark comparison script for OLMo2, AHA (baseline), AHA (optimized),
-AHA (routed), AHA (greedy), and Local-only.
+Benchmark comparison script for OLMo2, AHA variants, and Local-only.
 
-Compares six models:
+Compares seven models:
 1. OLMo2 (baseline)    - Standard OLMo2 without AHA (lower bound performance)
 2. AHA (baseline)      - Frozen AHA implementation
 3. AHA (optimized)     - Your optimized AHA implementation
 4. AHA (routed)        - Per-head routed AHA (skip unneeded attention types)
 5. AHA (greedy)        - Greedy local-first AHA (1-2 kernel calls total)
-6. Local-only          - All sliding window attention (upper bound performance)
+6. AHA (flashinfer)    - FlashInfer per-head router kernel (fused 1-kernel decode)
+7. Local-only          - All sliding window attention (upper bound performance)
 
 Usage:
     python benchmark_aha_full.py [OPTIONS]
 
 Options:
-    --num-prompts N      Number of prompts to benchmark (default: 500)
-    --input-len N        Input sequence length (default: 512)
-    --output-len N       Output sequence length (default: 128)
-    --max-num-seqs N     Maximum number of sequences in a batch (default: vLLM default)
-    --save-results       Save results to JSON file
-    --gpu-memory FLOAT   GPU memory utilization (default: 0.8)
-    --skip-local-only    Skip local-only (upper bound) benchmark
-    --skip-aha-routed    Skip AHA routed benchmark
-    --skip-aha-greedy    Skip AHA greedy benchmark
+    --num-prompts N       Number of prompts to benchmark (default: 500)
+    --input-len N         Input sequence length (default: 512)
+    --output-len N        Output sequence length (default: 128)
+    --max-num-seqs N      Maximum number of sequences in a batch (default: vLLM default)
+    --save-results        Save results to JSON file
+    --gpu-memory FLOAT    GPU memory utilization (default: 0.8)
+    --skip-aha-main       Skip both AHA baseline and optimized benchmarks
+    --skip-local-only     Skip local-only (upper bound) benchmark
+    --skip-aha-routed     Skip AHA routed benchmark
+    --skip-aha-greedy     Skip AHA greedy benchmark
+    --skip-aha-flashinfer Skip AHA flashinfer benchmark
 """
 
 import argparse
@@ -55,6 +57,7 @@ def run_benchmark(
     use_local_only: bool = False,
     use_routed: bool = False,
     use_greedy: bool = False,
+    use_flashinfer: bool = False,
 ) -> dict:
     """Run vllm benchmark and parse results."""
     cmd = [
@@ -96,6 +99,8 @@ def run_benchmark(
         display_name = "AHA (greedy)"
     elif use_routed:
         display_name = "AHA (routed)"
+    elif use_flashinfer:
+        display_name = "AHA (flashinfer)"
     else:
         display_name = "AHA (optimized)"
 
@@ -110,6 +115,8 @@ def run_benchmark(
         print(f"Using: olmo2_aha.py impl=greedy (greedy local-first)")
     elif use_routed:
         print(f"Using: olmo2_aha.py impl=routed (per-head routed)")
+    elif use_flashinfer:
+        print(f"Using: olmo2_aha.py impl=flashinfer (FlashInfer router kernel)")
     elif "AHA" in model.upper():
         print(f"Using: olmo2_aha.py impl=dual (optimized)")
     print(f"{'=' * 70}\n")
@@ -126,6 +133,8 @@ def run_benchmark(
         cmd += ["--hf-overrides", '{"attention_implementation": "greedy"}']
     elif use_routed:
         cmd += ["--hf-overrides", '{"attention_implementation": "routed"}']
+    elif use_flashinfer:
+        cmd += ["--hf-overrides", '{"attention_implementation": "flashinfer"}']
     else:
         cmd += ["--hf-overrides", '{"attention_implementation": "dual"}']
 
@@ -197,6 +206,7 @@ def print_comparison(
     aha_optimized_results: dict,
     aha_routed_results: dict,
     aha_greedy_results: dict,
+    aha_flashinfer_results: dict,
     local_only_results: dict,
 ):
     """Print side-by-side comparison of results."""
@@ -211,6 +221,7 @@ def print_comparison(
         ("AHA (optimized)", aha_optimized_results),
         ("AHA (routed)", aha_routed_results),
         ("AHA (greedy)", aha_greedy_results),
+        ("AHA (flashinfer)", aha_flashinfer_results),
         ("Local-only (upper)", local_only_results),
     ]
 
@@ -273,6 +284,10 @@ def print_comparison(
     greedy_output = get_metric(aha_greedy_results, "output_tokens_per_sec")
     greedy_requests = get_metric(aha_greedy_results, "throughput_requests_per_sec")
 
+    fi_total = get_metric(aha_flashinfer_results, "throughput_tokens_per_sec")
+    fi_output = get_metric(aha_flashinfer_results, "output_tokens_per_sec")
+    fi_requests = get_metric(aha_flashinfer_results, "throughput_requests_per_sec")
+
     print(
         f"{'AHA (optimized)':<20} | {fmt(optimized_total):>12} | {fmt(optimized_output):>12} | {fmt(optimized_requests):>8}"
     )
@@ -281,6 +296,9 @@ def print_comparison(
     )
     print(
         f"{'AHA (greedy)':<20} | {fmt(greedy_total):>12} | {fmt(greedy_output):>12} | {fmt(greedy_requests):>8}"
+    )
+    print(
+        f"{'AHA (flashinfer)':<20} | {fmt(fi_total):>12} | {fmt(fi_output):>12} | {fmt(fi_requests):>8}"
     )
     print(
         f"{'Local-only (upper)':<20} | {fmt(local_total):>12} | {fmt(local_output):>12} | {fmt(local_requests):>8}"
@@ -326,6 +344,14 @@ def print_comparison(
         f"{'Greedy gain':<20} | {diff_greedy_total:>12} | {diff_greedy_output:>12} | {diff_greedy_req:>8}"
     )
 
+    # AHA flashinfer vs AHA baseline (shows flashinfer gain)
+    diff_fi_total = calc_diff(fi_total, baseline_total)
+    diff_fi_output = calc_diff(fi_output, baseline_output)
+    diff_fi_req = calc_diff(fi_requests, baseline_requests)
+    print(
+        f"{'FlashInfer gain':<20} | {diff_fi_total:>12} | {diff_fi_output:>12} | {diff_fi_req:>8}"
+    )
+
     # Local-only vs OLMo2 (shows max possible gain)
     diff3_total = calc_diff(local_total, olmo2_total)
     diff3_output = calc_diff(local_output, olmo2_output)
@@ -368,6 +394,13 @@ def print_comparison(
         f"{'AHA greedy eff':<20} | {eff_g_total:>12} | {eff_g_output:>12} | {eff_g_req:>8}"
     )
 
+    eff_f_total = calc_efficiency(fi_total, olmo2_total, local_total)
+    eff_f_output = calc_efficiency(fi_output, olmo2_output, local_output)
+    eff_f_req = calc_efficiency(fi_requests, olmo2_requests, local_requests)
+    print(
+        f"{'AHA flashinfer eff':<20} | {eff_f_total:>12} | {eff_f_output:>12} | {eff_f_req:>8}"
+    )
+
     print("=" * 60 + "\n")
 
     print("Legend:")
@@ -377,12 +410,18 @@ def print_comparison(
     )
     print("  Routed gain        = AHA (routed) vs AHA (baseline) (positive = faster)")
     print("  Greedy gain        = AHA (greedy) vs AHA (baseline) (positive = faster)")
+    print(
+        "  FlashInfer gain    = AHA (flashinfer) vs AHA (baseline) (positive = faster)"
+    )
     print("  Local-only speedup = Local-only vs OLMo2 (shows max possible gain)")
     print(
         "  AHA opt efficiency = How close AHA optimized gets to local-only upper bound"
     )
     print("  AHA routed eff     = How close AHA routed gets to local-only upper bound")
     print("  AHA greedy eff     = How close AHA greedy gets to local-only upper bound")
+    print(
+        "  AHA flashinfer eff = How close AHA flashinfer gets to local-only upper bound"
+    )
     print("                       (100% = matches local-only, 0% = same as OLMo2)")
     print()
 
@@ -393,6 +432,7 @@ def save_results(
     aha_optimized_results: dict,
     aha_routed_results: dict,
     aha_greedy_results: dict,
+    aha_flashinfer_results: dict,
     local_only_results: dict,
     args: argparse.Namespace,
 ):
@@ -410,6 +450,7 @@ def save_results(
         "aha_optimized": aha_optimized_results,
         "aha_routed": aha_routed_results,
         "aha_greedy": aha_greedy_results,
+        "aha_flashinfer": aha_flashinfer_results,
         "local_only": local_only_results,
     }
 
@@ -473,6 +514,11 @@ def main():
         "--skip-olmo2", action="store_true", help="Skip OLMo2 baseline benchmark"
     )
     parser.add_argument(
+        "--skip-aha-main",
+        action="store_true",
+        help="Skip both AHA baseline and AHA optimized benchmarks",
+    )
+    parser.add_argument(
         "--skip-aha-baseline", action="store_true", help="Skip AHA baseline benchmark"
     )
     parser.add_argument(
@@ -483,6 +529,11 @@ def main():
     )
     parser.add_argument(
         "--skip-aha-greedy", action="store_true", help="Skip AHA greedy benchmark"
+    )
+    parser.add_argument(
+        "--skip-aha-flashinfer",
+        action="store_true",
+        help="Skip AHA flashinfer benchmark",
     )
     parser.add_argument(
         "--skip-local-only",
@@ -508,26 +559,35 @@ def main():
     )
     print(f"  3. AHA (optimized)     - Dual-kernel AHA (olmo2_aha.py impl=dual)")
     print(f"  4. AHA (routed)        - Per-head routed AHA (olmo2_aha.py impl=routed)")
-    print(f"  5. AHA (greedy)        - Greedy local-first AHA (olmo2_aha.py impl=greedy)")
-    print(f"  6. Local-only (upper)  - All sliding window attention (upper bound)")
+    print(
+        f"  5. AHA (greedy)        - Greedy local-first AHA (olmo2_aha.py impl=greedy)"
+    )
+    print(
+        f"  6. AHA (flashinfer)    - FlashInfer router kernel (olmo2_aha.py impl=flashinfer)"
+    )
+    print(f"  7. Local-only (upper)  - All sliding window attention (upper bound)")
 
     olmo2_results = {}
     aha_baseline_results = {}
     aha_optimized_results = {}
     aha_routed_results = {}
     aha_greedy_results = {}
+    aha_flashinfer_results = {}
     local_only_results = {}
+
+    skip_aha_baseline = args.skip_aha_main or args.skip_aha_baseline
+    skip_aha_optimized = args.skip_aha_main or args.skip_aha_optimized
 
     # Run benchmarks
     if not args.skip_olmo2:
         olmo2_results = run_benchmark(OLMO2_MODEL, args, trust_remote_code=False)
 
-    if not args.skip_aha_baseline:
+    if not skip_aha_baseline:
         aha_baseline_results = run_benchmark(
             AHA_MODEL, args, trust_remote_code=True, use_baseline=True
         )
 
-    if not args.skip_aha_optimized:
+    if not skip_aha_optimized:
         aha_optimized_results = run_benchmark(
             AHA_MODEL, args, trust_remote_code=True, use_baseline=False
         )
@@ -542,6 +602,11 @@ def main():
             AHA_MODEL, args, trust_remote_code=True, use_greedy=True
         )
 
+    if not args.skip_aha_flashinfer:
+        aha_flashinfer_results = run_benchmark(
+            AHA_MODEL, args, trust_remote_code=True, use_flashinfer=True
+        )
+
     if not args.skip_local_only:
         local_only_results = run_local_only_benchmark(args)
 
@@ -552,6 +617,7 @@ def main():
         aha_optimized_results,
         aha_routed_results,
         aha_greedy_results,
+        aha_flashinfer_results,
         local_only_results,
     )
 
@@ -563,6 +629,7 @@ def main():
             aha_optimized_results,
             aha_routed_results,
             aha_greedy_results,
+            aha_flashinfer_results,
             local_only_results,
             args,
         )

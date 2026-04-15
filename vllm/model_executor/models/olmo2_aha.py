@@ -6,11 +6,12 @@
 # AHA uses a learned per-head gate to route between global and local attention
 """Inference-only FAOlmo model with All-or-Here Attention (AHA).
 
-A single unified file containing all four attention implementations:
-  - "dual"     : always runs both global+local kernels, blends via gate
-  - "baseline" : alias for "dual" (frozen reference benchmark)
-  - "routed"   : per-GQA-group decode loop, skips unneeded attention types
-  - "greedy"   : local-first decode (1-2 kernel calls total)
+A single unified file containing all attention implementations:
+  - "dual"       : always runs both global+local kernels, blends via gate
+  - "baseline"   : alias for "dual" (frozen reference benchmark)
+  - "routed"     : per-GQA-group decode loop, skips unneeded attention types
+  - "greedy"     : local-first decode (1-2 kernel calls total)
+  - "flashinfer" : FlashInfer per-head router kernel (fused 1-kernel decode)
 
 The active implementation is selected from config.attention_implementation.
 The local sliding-window size is read from config.local_window_size (default 128).
@@ -1131,15 +1132,296 @@ class _AHAGreedyAttention(nn.Module):
         )
 
 
+class _AHAFlashInferAttention(nn.Module):
+    """
+    All-or-Here Attention — FlashInfer router kernel.
+
+    Uses FlashInfer's per-head router paged-attention kernel (use_router=True)
+    to fuse full-attention and SWA routing into a single kernel call.
+
+    Currently requires MHA (num_heads == num_kv_heads). The per-(token, q-head)
+    gate is passed straight through as the per-(seq, kv-head) router tensor.
+    GQA support would need a reduction rule across Q-heads in each group.
+
+    During prefill: full attention only — no routing (matches routed/greedy).
+    """
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__()
+        self.config = vllm_config.model_config.hf_config
+
+        hidden_size = self.config.hidden_size
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.total_num_heads = self.config.num_attention_heads
+
+        assert hidden_size % self.total_num_heads == 0
+        assert self.total_num_heads % self.tp_size == 0
+
+        self.num_heads = self.total_num_heads // self.tp_size
+        self.total_num_kv_heads = (
+            self.config.num_key_value_heads or self.total_num_heads
+        )
+        if self.total_num_kv_heads >= self.tp_size:
+            assert self.total_num_kv_heads % self.tp_size == 0
+        else:
+            assert self.tp_size % self.total_num_kv_heads == 0
+
+        self.num_kv_heads = max(1, self.total_num_kv_heads // self.tp_size)
+        self.head_dim = hidden_size // self.total_num_heads
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+        self.max_position_embeddings = self.config.max_position_embeddings
+        self.scaling = self.head_dim**-0.5
+        self.num_queries_per_kv = self.num_heads // self.num_kv_heads
+        self.local_window_size = getattr(self.config, "local_window_size", 128)
+
+        self.tp_rank = get_tensor_model_parallel_rank()
+
+        self.q_proj = ColumnParallelLinear(
+            hidden_size,
+            self.total_num_heads * self.head_dim + self.total_num_heads,
+            bias=False,
+            quant_config=vllm_config.quant_config,
+            prefix=f"{prefix}.q_proj",
+        )
+        self.k_proj = ColumnParallelLinear(
+            hidden_size,
+            self.total_num_kv_heads * self.head_dim,
+            bias=False,
+            quant_config=vllm_config.quant_config,
+            prefix=f"{prefix}.k_proj",
+        )
+        self.v_proj = ColumnParallelLinear(
+            hidden_size,
+            self.total_num_kv_heads * self.head_dim,
+            bias=False,
+            quant_config=vllm_config.quant_config,
+            prefix=f"{prefix}.v_proj",
+        )
+
+        self.q_norm = RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
+        self.k_norm = RMSNorm(
+            self.total_num_kv_heads * self.head_dim, eps=self.config.rms_norm_eps
+        )
+
+        rope_parameters = self.config.rope_parameters
+        self.rotary_emb = get_rope(
+            self.head_dim,
+            max_position=self.max_position_embeddings,
+            rope_parameters=rope_parameters,
+        )
+
+        self.kv_cache_attn = Attention(
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            num_kv_heads=self.num_kv_heads,
+            cache_config=vllm_config.cache_config,
+            quant_config=vllm_config.quant_config,
+            per_layer_sliding_window=None,
+            prefix=f"{prefix}.kv_cache_attn",
+        )
+
+        self.o_proj = RowParallelLinear(
+            self.total_num_heads * self.head_dim,
+            hidden_size,
+            bias=False,
+            quant_config=vllm_config.quant_config,
+            prefix=f"{prefix}.o_proj",
+        )
+
+        self._prefix = prefix
+        self._decode_wrapper = None
+        self._prefill_wrapper = None
+        self._workspace_buffer = None
+        self._kv_layout = None
+
+    def _apply_qk_norm(
+        self, q: torch.Tensor, k: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.tp_size > 1:
+            q = tensor_model_parallel_all_gather(q.contiguous())
+            k = tensor_model_parallel_all_gather(k.contiguous())
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        if self.tp_size > 1:
+            splitter = partial(
+                split_tensor_along_last_dim, num_partitions=self.tp_size
+            )
+            q = splitter(q)[self.tp_rank].contiguous()
+            k = splitter(k)[self.tp_rank].contiguous()
+        return q, k
+
+    def _ensure_wrappers(self, device: torch.device) -> None:
+        if self._decode_wrapper is not None:
+            return
+        import flashinfer
+        from vllm.v1.attention.backends.utils import get_kv_cache_layout
+        self._kv_layout = get_kv_cache_layout()
+        self._workspace_buffer = torch.empty(
+            128 * 1024 * 1024, dtype=torch.int8, device=device,
+        )
+        self._decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+            self._workspace_buffer, self._kv_layout, use_router=True,
+        )
+        self._prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            self._workspace_buffer, self._kv_layout,
+        )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        q_with_gate, _ = self.q_proj(hidden_states)
+        q, gate = q_with_gate.split([self.q_size, self.num_heads], dim=-1)
+        q = q.contiguous()
+        gate = gate.contiguous()
+
+        k, _ = self.k_proj(hidden_states)
+        v, _ = self.v_proj(hidden_states)
+
+        q, k = self._apply_qk_norm(q, k)
+        q, k = self.rotary_emb(positions, q, k)
+
+        attn_metadata, attn_layer, kv_cache = get_attention_context(
+            self.kv_cache_attn.layer_name
+        )
+
+        if attn_metadata is None or attn_metadata.max_query_len > 1:
+            return self._forward_prefill_full(q, k, v)
+        else:
+            gate_sigmoid = torch.sigmoid(gate)
+            gate_hard = (gate_sigmoid > 0.5).to(hidden_states.dtype)
+
+            if _GATE_STATS_ENABLED:
+                self._log_gate_stats(gate_hard)
+
+            return self._forward_decode_flashinfer(
+                q, k, v, gate_hard, attn_metadata, attn_layer, kv_cache
+            )
+
+    def _forward_prefill_full(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> torch.Tensor:
+        attn_output = self.kv_cache_attn(q, k, v)
+        output, _ = self.o_proj(attn_output)
+        return output
+
+    @torch.compiler.disable
+    def _forward_decode_flashinfer(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        gate_hard: torch.Tensor,
+        attn_metadata,
+        attn_layer,
+        kv_cache: torch.Tensor,
+    ) -> torch.Tensor:
+        N = q.shape[0]
+        q = q.view(N, self.num_heads, self.head_dim)
+        k = k.view(N, self.num_kv_heads, self.head_dim)
+        v = v.view(N, self.num_kv_heads, self.head_dim)
+
+        # Phase 0: KV cache update
+        forward_ctx = get_forward_context()
+        slot_mapping = forward_ctx.slot_mapping
+        if isinstance(slot_mapping, dict):
+            layer_slot_mapping = slot_mapping.get(self.kv_cache_attn.layer_name)
+        else:
+            layer_slot_mapping = slot_mapping
+
+        key_cache, value_cache = kv_cache.unbind(0)
+
+        if layer_slot_mapping is not None:
+            reshape_and_cache_flash(
+                k, v,
+                key_cache, value_cache,
+                layer_slot_mapping,
+                attn_layer.kv_cache_dtype,
+                attn_layer._k_scale,
+                attn_layer._v_scale,
+            )
+
+        # Phase 1: Build flashinfer paged-KV indptr/indices/last_page_len
+        # from vLLM's block_table + seq_lens.
+        self._ensure_wrappers(q.device)
+        block_size = key_cache.shape[1]
+        block_table = attn_metadata.block_table
+        seq_lens = attn_metadata.seq_lens
+        batch_size = seq_lens.shape[0]
+
+        num_blocks_per_seq = (seq_lens + block_size - 1) // block_size
+        kv_indptr = torch.zeros(
+            batch_size + 1, dtype=torch.int32, device=q.device,
+        )
+        kv_indptr[1:] = num_blocks_per_seq.to(torch.int32).cumsum(0)
+
+        max_blocks = int(num_blocks_per_seq.max().item())
+        row_idx = torch.arange(max_blocks, device=q.device).unsqueeze(0)
+        mask = row_idx < num_blocks_per_seq.unsqueeze(1)
+        kv_indices = block_table[:, :max_blocks][mask].to(torch.int32).contiguous()
+
+        kv_last_page_len = ((seq_lens - 1) % block_size + 1).to(torch.int32)
+
+        # Phase 2: MHA — gate is already shape [N, num_kv_heads] since
+        # num_heads == num_kv_heads. Pass through without reduction so the
+        # kernel sees the raw per-head routing signal.
+        assert self.num_queries_per_kv == 1, (
+            "FlashInfer AHA variant currently requires MHA "
+            "(num_heads == num_kv_heads). Got num_queries_per_kv="
+            f"{self.num_queries_per_kv}. GQA support requires a reduction rule."
+        )
+        router = gate_hard.to(torch.uint8).contiguous()
+
+        # Phase 3: Plan and run.
+        self._decode_wrapper.plan(
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            block_size,
+            window_left=self.local_window_size - 1,
+            q_data_type=q.dtype,
+            kv_data_type=key_cache.dtype,
+        )
+        output = self._decode_wrapper.run(
+            q, (key_cache, value_cache), router=router,
+        )
+
+        attn_output = output.view(N, -1)
+        output_final, _ = self.o_proj(attn_output)
+        return output_final
+
+    def _log_gate_stats(self, gate_hard: torch.Tensor) -> None:
+        global _gate_stats_counter
+        _gate_stats_counter += 1
+        if _gate_stats_counter % _GATE_STATS_INTERVAL != 0:
+            return
+        swa_frac = gate_hard.float().mean().item()
+        logger.info(
+            "FlashInfer router stats [%s] step=%d: SWA=%.1f%%, full=%.1f%%",
+            self._prefix, _gate_stats_counter,
+            swa_frac * 100, (1 - swa_frac) * 100,
+        )
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Dispatch table
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _ATTENTION_IMPLEMENTATIONS: dict[str, type[nn.Module]] = {
-    "dual":     _AHADualAttention,
-    "baseline": _AHADualAttention,   # same impl, used as frozen reference
-    "routed":   _AHARoutedAttention,
-    "greedy":   _AHAGreedyAttention,
+    "dual":       _AHADualAttention,
+    "baseline":   _AHADualAttention,   # same impl, used as frozen reference
+    "routed":     _AHARoutedAttention,
+    "greedy":     _AHAGreedyAttention,
+    "flashinfer": _AHAFlashInferAttention,
 }
 
 
