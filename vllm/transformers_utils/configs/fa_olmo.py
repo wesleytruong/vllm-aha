@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """vLLM-side config for the FAOlmo (AHA) model family.
 
-Compatible with the HuggingFace FAOlmo config (model_type = "fa_olmo").
+Compatible with the HuggingFace FAOlmo config (model_type = "faolmo").
 Adds two AHA-specific fields:
   - attention_implementation: "dual" | "routed" | "greedy" | "baseline"
   - local_window_size: sliding-window size for local attention heads (int)
@@ -20,7 +20,7 @@ _VALID_IMPLS = ("dual", "routed", "greedy", "baseline")
 
 
 class FAOlmoConfig(PretrainedConfig):
-    model_type = "fa_olmo"
+    model_type = "faolmo"
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(
