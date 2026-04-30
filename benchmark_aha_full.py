@@ -29,7 +29,9 @@ Options:
 """
 
 import argparse
+import hashlib
 import json
+import math
 import os
 import subprocess
 import sys
@@ -47,6 +49,105 @@ AHA_MODEL = "xuan-luo/AHA-OLMO2"
 
 # Local-only model (same as OLMo2, but uses local-only implementation)
 LOCAL_ONLY_MODEL = "allenai/OLMo-2-0425-1B"
+
+# Trained context length for both OLMo2 and AHA-OLMO2.
+TRAINED_MAX_POS = 4096
+
+# Tokenizer used to slice the real-text dataset to exact token lengths.
+# OLMo2 and AHA-OLMO2 share the same tokenizer (AHA is fine-tuned from OLMo2),
+# so a single JSONL works across all benchmarked variants.
+PROMPT_TOKENIZER = OLMO2_MODEL
+
+# Cache directory for pre-built prompt JSONLs.
+DATASET_CACHE_DIR = Path(".benchmark_datasets")
+
+
+def prepare_real_text_dataset(
+    hf_path: str,
+    hf_split: str,
+    hf_config: str | None,
+    text_column: str,
+    num_prompts: int,
+    input_len: int,
+    output_len: int,
+    tokenizer_name: str = PROMPT_TOKENIZER,
+) -> Path:
+    """Build a JSONL of `num_prompts` prompts, each exactly `input_len` tokens,
+    sliced from a long-context HF dataset. Cached on disk by content hash so
+    repeat runs don't re-tokenize.
+
+    Returns the path to the JSONL file consumable by vLLM's `custom` dataset.
+    """
+    DATASET_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    key = hashlib.sha1(
+        f"{hf_path}|{hf_config}|{hf_split}|{text_column}|{tokenizer_name}|"
+        f"{num_prompts}|{input_len}|{output_len}".encode()
+    ).hexdigest()[:16]
+    out_path = DATASET_CACHE_DIR / f"{Path(hf_path).name}_{key}.jsonl"
+    if out_path.exists():
+        print(f"[dataset] reusing cached prompts: {out_path}")
+        return out_path
+
+    print(
+        f"[dataset] building {num_prompts} prompts of {input_len} tokens from "
+        f"{hf_path} (split={hf_split}, config={hf_config}, column={text_column})"
+    )
+    # Lazy imports so users without `datasets` installed can still use --dataset random.
+    from datasets import load_dataset
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+    ds = load_dataset(hf_path, hf_config, split=hf_split, streaming=True)
+
+    needed_tokens = num_prompts * input_len
+    token_buffer: list[int] = []
+    for example in ds:
+        text = example.get(text_column)
+        if not text:
+            continue
+        ids = tokenizer.encode(text, add_special_tokens=False)
+        token_buffer.extend(ids)
+        if len(token_buffer) >= needed_tokens:
+            break
+
+    if len(token_buffer) < needed_tokens:
+        raise RuntimeError(
+            f"Dataset {hf_path}:{hf_split} only yielded {len(token_buffer)} "
+            f"tokens; need {needed_tokens} for {num_prompts}x{input_len}. "
+            "Try a different split or smaller --num-prompts/--input-len."
+        )
+
+    with out_path.open("w") as f:
+        for i in range(num_prompts):
+            chunk = token_buffer[i * input_len : (i + 1) * input_len]
+            prompt = tokenizer.decode(chunk, skip_special_tokens=True)
+            f.write(
+                json.dumps({"prompt": prompt, "output_tokens": output_len}) + "\n"
+            )
+
+    print(f"[dataset] wrote {out_path}")
+    return out_path
+
+
+def build_hf_overrides(args: argparse.Namespace, impl: str | None) -> str | None:
+    """Build the --hf-overrides JSON string for a single run.
+
+    Returns None when no overrides apply (lets vLLM derive everything from
+    the stock config).
+    """
+    overrides: dict = {}
+    if impl is not None:
+        overrides["attention_implementation"] = impl
+    if args.max_model_len is not None:
+        overrides["max_position_embeddings"] = args.max_model_len
+    if args.rope_scaling != "none":
+        overrides["rope_parameters"] = {
+            "rope_type": args.rope_scaling,
+            "factor": args.rope_scaling_factor,
+            "original_max_position_embeddings": TRAINED_MAX_POS,
+            "rope_theta": 500000.0,
+        }
+    return json.dumps(overrides) if overrides else None
 
 
 def run_benchmark(
@@ -72,18 +173,37 @@ def run_benchmark(
         "half",
         "--num-prompts",
         str(args.num_prompts),
-        "--dataset-name",
-        "random",
-        "--random-input-len",
-        str(args.input_len),
-        "--random-output-len",
-        str(args.output_len),
         "--gpu-memory-utilization",
         str(args.gpu_memory),
     ]
 
+    dataset_path = getattr(args, "_dataset_path", None)
+    if dataset_path is not None:
+        # Real-text JSONL prepared up-front; same file used across all variants.
+        cmd += [
+            "--dataset-name",
+            "custom",
+            "--dataset-path",
+            str(dataset_path),
+            "--custom-output-len",
+            str(args.output_len),
+            "--skip-chat-template",
+        ]
+    else:
+        cmd += [
+            "--dataset-name",
+            "random",
+            "--random-input-len",
+            str(args.input_len),
+            "--random-output-len",
+            str(args.output_len),
+        ]
+
     if args.max_num_seqs is not None:
         cmd.extend(["--max-num-seqs", str(args.max_num_seqs)])
+
+    if args.max_model_len is not None:
+        cmd.extend(["--max-model-len", str(args.max_model_len)])
 
     if trust_remote_code:
         cmd.append("--trust-remote-code")
@@ -125,18 +245,24 @@ def run_benchmark(
     # --hf-overrides to set attention_implementation in the config.
     env = os.environ.copy()
     env.pop("VLLM_LOCAL_ONLY", None)
+
+    impl: str | None = None
     if use_local_only:
         env["VLLM_LOCAL_ONLY"] = "1"
     elif use_baseline:
-        cmd += ["--hf-overrides", '{"attention_implementation": "baseline"}']
+        impl = "baseline"
     elif use_greedy:
-        cmd += ["--hf-overrides", '{"attention_implementation": "greedy"}']
+        impl = "greedy"
     elif use_routed:
-        cmd += ["--hf-overrides", '{"attention_implementation": "routed"}']
+        impl = "routed"
     elif use_flashinfer:
-        cmd += ["--hf-overrides", '{"attention_implementation": "flashinfer"}']
-    else:
-        cmd += ["--hf-overrides", '{"attention_implementation": "dual"}']
+        impl = "flashinfer"
+    elif "AHA" in model.upper():
+        impl = "dual"
+
+    overrides_json = build_hf_overrides(args, impl)
+    if overrides_json is not None:
+        cmd += ["--hf-overrides", overrides_json]
 
     try:
         result = subprocess.run(
@@ -484,13 +610,13 @@ def main():
     parser.add_argument(
         "--input-len",
         type=int,
-        default=512,
+        default=128,
         help="Input sequence length (default: 512)",
     )
     parser.add_argument(
         "--output-len",
         type=int,
-        default=512,
+        default=1024,
         help="Output sequence length (default: 128)",
     )
     parser.add_argument(
@@ -504,6 +630,69 @@ def main():
         type=int,
         default=None,
         help="Maximum number of sequences in a batch (default: vLLM default)",
+    )
+    parser.add_argument(
+        "--max-model-len",
+        type=int,
+        default=None,
+        help=(
+            "Override max context length. When set, also overrides "
+            "max_position_embeddings in the HF config. Unset keeps the "
+            f"trained default ({TRAINED_MAX_POS})."
+        ),
+    )
+    parser.add_argument(
+        "--rope-scaling",
+        choices=["none", "linear", "yarn"],
+        default="none",
+        help=(
+            "RoPE scaling type to inject via hf_overrides. Required for "
+            "coherent generation beyond the trained length of "
+            f"{TRAINED_MAX_POS}. Does not affect speed measurements."
+        ),
+    )
+    parser.add_argument(
+        "--rope-scaling-factor",
+        type=float,
+        default=None,
+        help=(
+            "RoPE scaling factor. Defaults to ceil(max_model_len / "
+            f"{TRAINED_MAX_POS} * 2) / 2 when --rope-scaling is set."
+        ),
+    )
+    parser.add_argument(
+        "--dataset",
+        choices=["pg19", "random", "hf"],
+        default="pg19",
+        help=(
+            "Prompt source. 'pg19' (default) slices real text from "
+            "emozilla/pg19-test to exact token lengths. 'random' uses vLLM's "
+            "random-token generator (legacy). 'hf' lets you point at any HF "
+            "dataset via --hf-dataset-path."
+        ),
+    )
+    parser.add_argument(
+        "--hf-dataset-path",
+        default=None,
+        help=(
+            "HF dataset id when --dataset=hf (e.g. 'pg19', 'tau/scrolls'). "
+            "Ignored otherwise."
+        ),
+    )
+    parser.add_argument(
+        "--hf-dataset-config",
+        default=None,
+        help="Optional HF dataset config/subset name.",
+    )
+    parser.add_argument(
+        "--hf-dataset-split",
+        default="test",
+        help="HF dataset split (default: test).",
+    )
+    parser.add_argument(
+        "--hf-text-column",
+        default="text",
+        help="Column to read text from (default: 'text').",
     )
     parser.add_argument(
         "--save-results",
@@ -542,6 +731,42 @@ def main():
     )
 
     args = parser.parse_args()
+
+    if args.rope_scaling != "none" and args.rope_scaling_factor is None:
+        effective_len = args.max_model_len or TRAINED_MAX_POS
+        ratio = max(1.0, effective_len / TRAINED_MAX_POS)
+        args.rope_scaling_factor = math.ceil(ratio * 2) / 2
+
+    if args.rope_scaling != "none" and args.max_model_len is None:
+        print(
+            "WARNING: --rope-scaling set without --max-model-len; scaling "
+            "will apply but max context remains at the trained length."
+        )
+
+    # Build the real-text prompt JSONL once and reuse across all variants.
+    args._dataset_path = None
+    if args.dataset == "pg19":
+        args._dataset_path = prepare_real_text_dataset(
+            hf_path="emozilla/pg19-test",
+            hf_split="test",
+            hf_config=None,
+            text_column="text",
+            num_prompts=args.num_prompts,
+            input_len=args.input_len,
+            output_len=args.output_len,
+        )
+    elif args.dataset == "hf":
+        if args.hf_dataset_path is None:
+            parser.error("--dataset=hf requires --hf-dataset-path")
+        args._dataset_path = prepare_real_text_dataset(
+            hf_path=args.hf_dataset_path,
+            hf_split=args.hf_dataset_split,
+            hf_config=args.hf_dataset_config,
+            text_column=args.hf_text_column,
+            num_prompts=args.num_prompts,
+            input_len=args.input_len,
+            output_len=args.output_len,
+        )
 
     print("\n" + "=" * 90)
     print("              OLMo2 vs AHA vs Local-only Performance Comparison")
