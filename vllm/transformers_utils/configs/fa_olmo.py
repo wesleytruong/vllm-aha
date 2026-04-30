@@ -48,6 +48,16 @@ class FAOlmoConfig(PretrainedConfig):
         local_window_size: int = 128,
         **kwargs,
     ):
+        # AHA has no model-level sliding window. Some AHA checkpoints carry a
+        # `sliding_window` field in config.json inherited from OLMo2-family
+        # ancestors. If left in kwargs, PretrainedConfig stores it and vLLM
+        # propagates it to cache_config.sliding_window, which then silently
+        # caps every "full attention" layer to that window (see
+        # vllm/model_executor/layers/attention/attention.py:212-219). AHA
+        # expresses locality exclusively via per-layer `local_window_size` on
+        # its local heads; the model-level field has no meaning here.
+        kwargs.pop("sliding_window", None)
+
         if "architectures" not in kwargs:
             kwargs["architectures"] = ["FAOlmoForCausalLM"]
 
@@ -58,6 +68,8 @@ class FAOlmoConfig(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
+        # Defensive: override in case PretrainedConfig set it from another source.
+        self.sliding_window = None
 
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
