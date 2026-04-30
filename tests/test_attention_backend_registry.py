@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import pytest
+
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionImpl,
@@ -124,6 +126,22 @@ def test_register_custom_backend_with_class_path():
     backend_cls = AttentionBackendEnum.CUSTOM.get_class()
     assert backend_cls.get_name() == "CUSTOM"
     assert backend_cls.get_impl_cls() == CustomAttentionImpl
+
+
+def test_aha_flashinfer_backend_reuses_flashinfer_identity():
+    pytest.importorskip("flashinfer")
+
+    from vllm.v1.attention.backends.aha_flashinfer import (
+        AHAFlashInferBackend,
+        AHAFlashInferMetadataBuilder,
+    )
+
+    assert AHAFlashInferBackend.get_name() == "FLASHINFER"
+    assert (
+        AttentionBackendEnum[AHAFlashInferBackend.get_name()]
+        is AttentionBackendEnum.FLASHINFER
+    )
+    assert AHAFlashInferBackend.get_builder_cls() is AHAFlashInferMetadataBuilder
 
 
 def test_mamba_custom_is_not_alias_of_any_backend():

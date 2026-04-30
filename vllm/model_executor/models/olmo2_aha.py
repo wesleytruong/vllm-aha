@@ -63,13 +63,14 @@ from vllm.v1.attention.backends.fa_utils import (
     flash_attn_varlen_func,
     reshape_and_cache_flash,
 )
+from vllm.v1.attention.backends.aha_flashinfer import AHAFlashInferBackend
 
 logger = init_logger(__name__)
 
 # ── Gate statistics logging ──────────────────────────────────────────────────
 _GATE_STATS_ENABLED = bool(os.environ.get("VLLM_AHA_GATE_STATS"))
 _gate_stats_counter = 0
-_GATE_STATS_INTERVAL = 100
+_GATE_STATS_INTERVAL = int(os.environ.get("VLLM_AHA_GATE_STATS_INTERVAL", "100"))
 
 # ── Phase timing ─────────────────────────────────────────────────────────────
 _TIMING_ENABLED = bool(os.environ.get("VLLM_AHA_TIMING"))
@@ -1139,9 +1140,13 @@ class _AHAFlashInferAttention(nn.Module):
     Uses FlashInfer's per-head router paged-attention kernel (use_router=True)
     to fuse full-attention and SWA routing into a single kernel call.
 
-    Currently requires MHA (num_heads == num_kv_heads). The per-(token, q-head)
-    gate is passed straight through as the per-(seq, kv-head) router tensor.
-    GQA support would need a reduction rule across Q-heads in each group.
+    The AHAFlashInferBackend subclass plans a router-enabled decode wrapper
+    in FlashInferMetadataBuilder.build() (outside the model forward / Dynamo
+    trace). During decode, the forward reads attn_metadata.router_decode_wrapper
+    directly — no Python-land allocation or caching in the forward path.
+
+    Currently requires MHA (num_heads == num_kv_heads). GQA support would
+    need a reduction rule across Q-heads in each KV-head group.
 
     During prefill: full attention only — no routing (matches routed/greedy).
     """
@@ -1220,6 +1225,7 @@ class _AHAFlashInferAttention(nn.Module):
             quant_config=vllm_config.quant_config,
             per_layer_sliding_window=None,
             prefix=f"{prefix}.kv_cache_attn",
+            attn_backend=AHAFlashInferBackend,
         )
 
         self.o_proj = RowParallelLinear(
@@ -1231,10 +1237,6 @@ class _AHAFlashInferAttention(nn.Module):
         )
 
         self._prefix = prefix
-        self._decode_wrapper = None
-        self._prefill_wrapper = None
-        self._workspace_buffer = None
-        self._kv_layout = None
 
     def _apply_qk_norm(
         self, q: torch.Tensor, k: torch.Tensor
@@ -1251,22 +1253,6 @@ class _AHAFlashInferAttention(nn.Module):
             q = splitter(q)[self.tp_rank].contiguous()
             k = splitter(k)[self.tp_rank].contiguous()
         return q, k
-
-    def _ensure_wrappers(self, device: torch.device) -> None:
-        if self._decode_wrapper is not None:
-            return
-        import flashinfer
-        from vllm.v1.attention.backends.utils import get_kv_cache_layout
-        self._kv_layout = get_kv_cache_layout()
-        self._workspace_buffer = torch.empty(
-            128 * 1024 * 1024, dtype=torch.int8, device=device,
-        )
-        self._decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-            self._workspace_buffer, self._kv_layout, use_router=True,
-        )
-        self._prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-            self._workspace_buffer, self._kv_layout,
-        )
 
     def forward(
         self,
@@ -1288,7 +1274,17 @@ class _AHAFlashInferAttention(nn.Module):
             self.kv_cache_attn.layer_name
         )
 
-        if attn_metadata is None or attn_metadata.max_query_len > 1:
+        # Pure-decode only routes through the router kernel; anything with
+        # prefill tokens (including mixed batches) goes through the standard
+        # FlashInfer backend via self.kv_cache_attn(q, k, v), which handles
+        # the KV write + full-attention internally.
+        is_pure_decode = (
+            attn_metadata is not None
+            and attn_metadata.num_prefills == 0
+            and attn_metadata.num_decodes > 0
+        )
+
+        if not is_pure_decode:
             return self._forward_prefill_full(q, k, v)
         else:
             gate_sigmoid = torch.sigmoid(gate)
@@ -1311,7 +1307,6 @@ class _AHAFlashInferAttention(nn.Module):
         output, _ = self.o_proj(attn_output)
         return output
 
-    @torch.compiler.disable
     def _forward_decode_flashinfer(
         self,
         q: torch.Tensor,
@@ -1327,50 +1322,18 @@ class _AHAFlashInferAttention(nn.Module):
         k = k.view(N, self.num_kv_heads, self.head_dim)
         v = v.view(N, self.num_kv_heads, self.head_dim)
 
-        # Phase 0: KV cache update
-        forward_ctx = get_forward_context()
-        slot_mapping = forward_ctx.slot_mapping
-        if isinstance(slot_mapping, dict):
-            layer_slot_mapping = slot_mapping.get(self.kv_cache_attn.layer_name)
-        else:
-            layer_slot_mapping = slot_mapping
+        key_cache = kv_cache[:, 0]
+        value_cache = kv_cache[:, 1]
 
-        key_cache, value_cache = kv_cache.unbind(0)
-
-        if layer_slot_mapping is not None:
-            reshape_and_cache_flash(
-                k, v,
-                key_cache, value_cache,
-                layer_slot_mapping,
-                attn_layer.kv_cache_dtype,
-                attn_layer._k_scale,
-                attn_layer._v_scale,
-            )
-
-        # Phase 1: Build flashinfer paged-KV indptr/indices/last_page_len
-        # from vLLM's block_table + seq_lens.
-        self._ensure_wrappers(q.device)
-        block_size = key_cache.shape[1]
-        block_table = attn_metadata.block_table
-        seq_lens = attn_metadata.seq_lens
-        batch_size = seq_lens.shape[0]
-
-        num_blocks_per_seq = (seq_lens + block_size - 1) // block_size
-        kv_indptr = torch.zeros(
-            batch_size + 1, dtype=torch.int32, device=q.device,
+        reshape_and_cache_flash(
+            k, v,
+            key_cache, value_cache,
+            attn_metadata.slot_mapping,
+            attn_layer.kv_cache_dtype,
+            attn_layer._k_scale,
+            attn_layer._v_scale,
         )
-        kv_indptr[1:] = num_blocks_per_seq.to(torch.int32).cumsum(0)
 
-        max_blocks = int(num_blocks_per_seq.max().item())
-        row_idx = torch.arange(max_blocks, device=q.device).unsqueeze(0)
-        mask = row_idx < num_blocks_per_seq.unsqueeze(1)
-        kv_indices = block_table[:, :max_blocks][mask].to(torch.int32).contiguous()
-
-        kv_last_page_len = ((seq_lens - 1) % block_size + 1).to(torch.int32)
-
-        # Phase 2: MHA — gate is already shape [N, num_kv_heads] since
-        # num_heads == num_kv_heads. Pass through without reduction so the
-        # kernel sees the raw per-head routing signal.
         assert self.num_queries_per_kv == 1, (
             "FlashInfer AHA variant currently requires MHA "
             "(num_heads == num_kv_heads). Got num_queries_per_kv="
@@ -1378,20 +1341,9 @@ class _AHAFlashInferAttention(nn.Module):
         )
         router = gate_hard.to(torch.uint8).contiguous()
 
-        # Phase 3: Plan and run.
-        self._decode_wrapper.plan(
-            kv_indptr,
-            kv_indices,
-            kv_last_page_len,
-            self.num_heads,
-            self.num_kv_heads,
-            self.head_dim,
-            block_size,
-            window_left=self.local_window_size - 1,
-            q_data_type=q.dtype,
-            kv_data_type=key_cache.dtype,
-        )
-        output = self._decode_wrapper.run(
+        router_wrapper = attn_metadata.router_decode_wrapper
+        assert router_wrapper is not None
+        output = router_wrapper.run(
             q, (key_cache, value_cache), router=router,
         )
 
@@ -1399,16 +1351,18 @@ class _AHAFlashInferAttention(nn.Module):
         output_final, _ = self.o_proj(attn_output)
         return output_final
 
+    @torch.compiler.disable
     def _log_gate_stats(self, gate_hard: torch.Tensor) -> None:
         global _gate_stats_counter
         _gate_stats_counter += 1
         if _gate_stats_counter % _GATE_STATS_INTERVAL != 0:
             return
         swa_frac = gate_hard.float().mean().item()
-        logger.info(
-            "FlashInfer router stats [%s] step=%d: SWA=%.1f%%, full=%.1f%%",
-            self._prefix, _gate_stats_counter,
-            swa_frac * 100, (1 - swa_frac) * 100,
+        print(
+            f"[fi router stats] {self._prefix} step={_gate_stats_counter} "
+            f"SWA={swa_frac*100:.1f}% full={(1-swa_frac)*100:.1f}% "
+            f"shape={tuple(gate_hard.shape)}",
+            flush=True,
         )
 
 
