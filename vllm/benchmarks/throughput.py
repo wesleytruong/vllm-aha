@@ -20,6 +20,7 @@ from vllm.benchmarks.datasets import (
     AIMODataset,
     BurstGPTDataset,
     ConversationDataset,
+    CustomDataset,
     InstructCoderDataset,
     MultiModalConversationDataset,
     PrefixRepetitionRandomDataset,
@@ -386,6 +387,17 @@ def get_requests(args, tokenizer):
             sample_kwargs["output_len"] = args.output_len
     elif args.dataset_name == "burstgpt":
         dataset_cls = BurstGPTDataset
+    elif args.dataset_name == "custom":
+        dataset_cls = CustomDataset
+        # Prefer --custom-output-len if defined, fall back to --output-len.
+        custom_output_len = getattr(args, "custom_output_len", None)
+        sample_kwargs["output_len"] = (
+            custom_output_len if custom_output_len is not None else args.output_len
+        )
+        sample_kwargs["skip_chat_template"] = getattr(
+            args, "skip_chat_template", False
+        )
+        sample_kwargs["no_oversample"] = getattr(args, "no_oversample", False)
     elif args.dataset_name == "hf":
         if args.output_len is not None:
             sample_kwargs["output_len"] = args.output_len
@@ -692,6 +704,7 @@ def add_cli_args(parser: argparse.ArgumentParser):
             "prefix_repetition",
             "random-mm",
             "random-rerank",
+            "custom",
         ],
         help="Name of the dataset to benchmark on.",
         default="sharegpt",
@@ -828,6 +841,21 @@ def add_cli_args(parser: argparse.ArgumentParser):
     # (random, random-mm, random-rerank)
     add_random_dataset_base_args(parser)
     add_random_multimodal_dataset_args(parser)
+
+    # (custom)
+    parser.add_argument(
+        "--custom-output-len",
+        type=int,
+        default=None,
+        help="Number of output tokens per request, used only for the custom "
+        "dataset. Falls back to --output-len when unset.",
+    )
+    parser.add_argument(
+        "--skip-chat-template",
+        action="store_true",
+        help="Skip applying chat template to prompts for datasets that "
+        "support it (e.g. custom).",
+    )
 
     parser = AsyncEngineArgs.add_cli_args(parser)
 
