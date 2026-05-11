@@ -36,6 +36,7 @@ import os
 import subprocess
 import sys
 import re
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -150,17 +151,18 @@ def build_hf_overrides(args: argparse.Namespace, impl: str | None) -> str | None
     return json.dumps(overrides) if overrides else None
 
 
-def run_benchmark(
+def _build_throughput_cmd(
     model: str,
     args: argparse.Namespace,
-    trust_remote_code: bool = False,
-    use_baseline: bool = False,
-    use_local_only: bool = False,
-    use_routed: bool = False,
-    use_greedy: bool = False,
-    use_flashinfer: bool = False,
-) -> dict:
-    """Run vllm benchmark and parse results."""
+    output_len: int,
+    json_path: Path,
+    trust_remote_code: bool,
+) -> list[str]:
+    """Construct the `vllm bench throughput` argv for one pass.
+
+    `output_len` and `json_path` are parameterized so the same builder serves
+    both the full run and the calibration pass (output_len=1).
+    """
     cmd = [
         sys.executable,
         "-m",
@@ -175,6 +177,8 @@ def run_benchmark(
         str(args.num_prompts),
         "--gpu-memory-utilization",
         str(args.gpu_memory),
+        "--output-json",
+        str(json_path),
     ]
 
     dataset_path = getattr(args, "_dataset_path", None)
@@ -186,7 +190,7 @@ def run_benchmark(
             "--dataset-path",
             str(dataset_path),
             "--custom-output-len",
-            str(args.output_len),
+            str(output_len),
             "--skip-chat-template",
         ]
     else:
@@ -196,7 +200,7 @@ def run_benchmark(
             "--random-input-len",
             str(args.input_len),
             "--random-output-len",
-            str(args.output_len),
+            str(output_len),
         ]
 
     if args.max_num_seqs is not None:
@@ -208,6 +212,35 @@ def run_benchmark(
     if trust_remote_code:
         cmd.append("--trust-remote-code")
 
+    return cmd
+
+
+def _read_elapsed_time(json_path: Path) -> float | None:
+    """Extract elapsed_time (seconds) from vLLM bench throughput's --output-json file."""
+    try:
+        data = json.loads(json_path.read_text())
+        v = data.get("elapsed_time")
+        return float(v) if v is not None else None
+    except (FileNotFoundError, json.JSONDecodeError, ValueError, OSError):
+        return None
+
+
+def run_benchmark(
+    model: str,
+    args: argparse.Namespace,
+    trust_remote_code: bool = False,
+    use_baseline: bool = False,
+    use_local_only: bool = False,
+    use_routed: bool = False,
+    use_greedy: bool = False,
+    use_flashinfer: bool = False,
+) -> dict:
+    """Run vllm benchmark and parse results.
+
+    When `args.measure_phases` is set, a calibration pass with output_len=1
+    runs first to capture T_prefill, then the full run captures T_total. The
+    returned dict gains prefill/decode latency and tok/s fields.
+    """
     # Display name for output
     if use_local_only:
         display_name = "Local-only (upper)"
@@ -261,37 +294,89 @@ def run_benchmark(
         impl = "dual"
 
     overrides_json = build_hf_overrides(args, impl)
-    if overrides_json is not None:
-        cmd += ["--hf-overrides", overrides_json]
 
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=1800,  # 30 minute timeout
-            env=env,
-        )
+    def _do_pass(output_len: int, label: str) -> dict:
+        """Run one subprocess pass and return parsed metrics (or error dict)."""
+        with tempfile.NamedTemporaryFile(
+            prefix=f"aha_{label}_", suffix=".json", delete=False
+        ) as tmp:
+            json_path = Path(tmp.name)
+        try:
+            cmd = _build_throughput_cmd(
+                model, args, output_len, json_path, trust_remote_code
+            )
+            if overrides_json is not None:
+                cmd += ["--hf-overrides", overrides_json]
+            try:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=1800,  # 30 minute timeout
+                    env=env,
+                )
+            except subprocess.TimeoutExpired:
+                print(f"ERROR: {label} pass timed out after 30 minutes")
+                return {"error": "timeout"}
+            except Exception as e:
+                print(f"ERROR: {label} pass: {e}")
+                return {"error": str(e)}
 
-        output = result.stdout + result.stderr
-        print(output)
+            output = result.stdout + result.stderr
+            print(output)
+            if result.returncode != 0:
+                print(
+                    f"ERROR: {label} pass failed with return code {result.returncode}"
+                )
+                return {"error": output[:500]}
 
-        if result.returncode != 0:
-            print(f"ERROR: Benchmark failed with return code {result.returncode}")
-            return {"error": output[:500], "model": model, "display_name": display_name}
+            metrics = parse_benchmark_output(output)
+            elapsed = _read_elapsed_time(json_path)
+            if elapsed is not None:
+                metrics["elapsed_time"] = elapsed
+            return metrics
+        finally:
+            json_path.unlink(missing_ok=True)
 
-        # Parse throughput metrics from output
-        metrics = parse_benchmark_output(output)
-        metrics["model"] = model
-        metrics["display_name"] = display_name
+    # Optional calibration pass (output_len=1) for prefill timing.
+    # Approximation: T_calib ≈ T_prefill + 1 decode step (decode step is
+    # negligible at long context, ~µs vs prefill seconds).
+    calib_metrics: dict | None = None
+    if getattr(args, "measure_phases", False):
+        print(f"[phases] calibration pass: output_len=1 to isolate prefill")
+        calib_metrics = _do_pass(output_len=1, label="calib")
+        if "error" in calib_metrics:
+            print(
+                f"WARNING: calibration pass failed; phase metrics unavailable for "
+                f"{display_name}"
+            )
+
+    # Full pass.
+    metrics = _do_pass(output_len=args.output_len, label="full")
+    metrics["model"] = model
+    metrics["display_name"] = display_name
+    if "error" in metrics:
         return metrics
 
-    except subprocess.TimeoutExpired:
-        print(f"ERROR: Benchmark timed out after 30 minutes")
-        return {"error": "timeout", "model": model, "display_name": display_name}
-    except Exception as e:
-        print(f"ERROR: {e}")
-        return {"error": str(e), "model": model, "display_name": display_name}
+    # Compute phase-decomposed metrics if calibration succeeded.
+    if (
+        calib_metrics is not None
+        and "error" not in calib_metrics
+        and "elapsed_time" in calib_metrics
+        and "elapsed_time" in metrics
+    ):
+        T_calib = calib_metrics["elapsed_time"]
+        T_total = metrics["elapsed_time"]
+        T_decode = max(T_total - T_calib, 1e-9)
+        total_prompt = metrics.get("total_prompt_tokens")
+        total_output = metrics.get("total_output_tokens")
+        if total_prompt and total_output:
+            metrics["prefill_ms_per_token"] = T_calib * 1000.0 / total_prompt
+            metrics["decode_ms_per_token"] = T_decode * 1000.0 / total_output
+            metrics["prefill_tok_per_sec"] = total_prompt / T_calib
+            metrics["decode_tok_per_sec"] = total_output / T_decode
+
+    return metrics
 
 
 def run_local_only_benchmark(args: argparse.Namespace) -> dict:
@@ -371,11 +456,39 @@ def print_comparison(
             return results.get(key, "N/A")
         return "N/A"
 
+    # Phase-decomposed columns appear only when at least one variant has them.
+    has_phases = any(
+        results
+        and "error" not in results
+        and results.get("prefill_ms_per_token") is not None
+        for _, results in all_results
+    )
+
+    def fmt_phase(v):
+        if isinstance(v, (int, float)):
+            return f"{v:.4f}"
+        return "—"
+
+    phase_header = (
+        f" | {'Prefill ms/tok':>14} | {'Decode ms/tok':>14}" if has_phases else ""
+    )
+    phase_sep = "-+-" + "-" * 14 + "-+-" + "-" * 14 if has_phases else ""
+    phase_blank = f" | {'':>14} | {'':>14}" if has_phases else ""
+
+    def variant_phase_cells(results) -> str:
+        if not has_phases:
+            return ""
+        p = get_metric(results, "prefill_ms_per_token")
+        d = get_metric(results, "decode_ms_per_token")
+        return f" | {fmt_phase(p):>14} | {fmt_phase(d):>14}"
+
     # Print header
     print(
-        f"\n{'Model':<20} | {'Total tok/s':>12} | {'Output tok/s':>12} | {'Req/s':>8}"
+        f"\n{'Model':<20} | {'Total tok/s':>12} | {'Output tok/s':>12} | {'Req/s':>8}{phase_header}"
     )
-    print("-" * 20 + "-+-" + "-" * 12 + "-+-" + "-" * 12 + "-+-" + "-" * 8)
+    print(
+        "-" * 20 + "-+-" + "-" * 12 + "-+-" + "-" * 12 + "-+-" + "-" * 8 + phase_sep
+    )
 
     # Get metrics
     olmo2_total = get_metric(olmo2_results, "throughput_tokens_per_sec")
@@ -397,10 +510,10 @@ def print_comparison(
     local_requests = get_metric(local_only_results, "throughput_requests_per_sec")
 
     print(
-        f"{'OLMo2 (baseline)':<20} | {fmt(olmo2_total):>12} | {fmt(olmo2_output):>12} | {fmt(olmo2_requests):>8}"
+        f"{'OLMo2 (baseline)':<20} | {fmt(olmo2_total):>12} | {fmt(olmo2_output):>12} | {fmt(olmo2_requests):>8}{variant_phase_cells(olmo2_results)}"
     )
     print(
-        f"{'AHA (baseline)':<20} | {fmt(baseline_total):>12} | {fmt(baseline_output):>12} | {fmt(baseline_requests):>8}"
+        f"{'AHA (baseline)':<20} | {fmt(baseline_total):>12} | {fmt(baseline_output):>12} | {fmt(baseline_requests):>8}{variant_phase_cells(aha_baseline_results)}"
     )
     routed_total = get_metric(aha_routed_results, "throughput_tokens_per_sec")
     routed_output = get_metric(aha_routed_results, "output_tokens_per_sec")
@@ -415,23 +528,25 @@ def print_comparison(
     fi_requests = get_metric(aha_flashinfer_results, "throughput_requests_per_sec")
 
     print(
-        f"{'AHA (optimized)':<20} | {fmt(optimized_total):>12} | {fmt(optimized_output):>12} | {fmt(optimized_requests):>8}"
+        f"{'AHA (optimized)':<20} | {fmt(optimized_total):>12} | {fmt(optimized_output):>12} | {fmt(optimized_requests):>8}{variant_phase_cells(aha_optimized_results)}"
     )
     print(
-        f"{'AHA (routed)':<20} | {fmt(routed_total):>12} | {fmt(routed_output):>12} | {fmt(routed_requests):>8}"
+        f"{'AHA (routed)':<20} | {fmt(routed_total):>12} | {fmt(routed_output):>12} | {fmt(routed_requests):>8}{variant_phase_cells(aha_routed_results)}"
     )
     print(
-        f"{'AHA (greedy)':<20} | {fmt(greedy_total):>12} | {fmt(greedy_output):>12} | {fmt(greedy_requests):>8}"
+        f"{'AHA (greedy)':<20} | {fmt(greedy_total):>12} | {fmt(greedy_output):>12} | {fmt(greedy_requests):>8}{variant_phase_cells(aha_greedy_results)}"
     )
     print(
-        f"{'AHA (flashinfer)':<20} | {fmt(fi_total):>12} | {fmt(fi_output):>12} | {fmt(fi_requests):>8}"
+        f"{'AHA (flashinfer)':<20} | {fmt(fi_total):>12} | {fmt(fi_output):>12} | {fmt(fi_requests):>8}{variant_phase_cells(aha_flashinfer_results)}"
     )
     print(
-        f"{'Local-only (upper)':<20} | {fmt(local_total):>12} | {fmt(local_output):>12} | {fmt(local_requests):>8}"
+        f"{'Local-only (upper)':<20} | {fmt(local_total):>12} | {fmt(local_output):>12} | {fmt(local_requests):>8}{variant_phase_cells(local_only_results)}"
     )
 
     # Calculate differences
-    print("-" * 20 + "-+-" + "-" * 12 + "-+-" + "-" * 12 + "-+-" + "-" * 8)
+    print(
+        "-" * 20 + "-+-" + "-" * 12 + "-+-" + "-" * 12 + "-+-" + "-" * 8 + phase_sep
+    )
 
     def calc_diff(a, b):
         if isinstance(a, (int, float)) and isinstance(b, (int, float)) and b != 0:
@@ -443,7 +558,7 @@ def print_comparison(
     diff1_output = calc_diff(baseline_output, olmo2_output)
     diff1_req = calc_diff(baseline_requests, olmo2_requests)
     print(
-        f"{'AHA overhead':<20} | {diff1_total:>12} | {diff1_output:>12} | {diff1_req:>8}"
+        f"{'AHA overhead':<20} | {diff1_total:>12} | {diff1_output:>12} | {diff1_req:>8}{phase_blank}"
     )
 
     # AHA optimized vs AHA baseline (shows optimization gain)
@@ -451,7 +566,7 @@ def print_comparison(
     diff2_output = calc_diff(optimized_output, baseline_output)
     diff2_req = calc_diff(optimized_requests, baseline_requests)
     print(
-        f"{'Optimization gain':<20} | {diff2_total:>12} | {diff2_output:>12} | {diff2_req:>8}"
+        f"{'Optimization gain':<20} | {diff2_total:>12} | {diff2_output:>12} | {diff2_req:>8}{phase_blank}"
     )
 
     # AHA routed vs AHA baseline (shows routed gain)
@@ -459,7 +574,7 @@ def print_comparison(
     diff_routed_output = calc_diff(routed_output, baseline_output)
     diff_routed_req = calc_diff(routed_requests, baseline_requests)
     print(
-        f"{'Routed gain':<20} | {diff_routed_total:>12} | {diff_routed_output:>12} | {diff_routed_req:>8}"
+        f"{'Routed gain':<20} | {diff_routed_total:>12} | {diff_routed_output:>12} | {diff_routed_req:>8}{phase_blank}"
     )
 
     # AHA greedy vs AHA baseline (shows greedy gain)
@@ -467,7 +582,7 @@ def print_comparison(
     diff_greedy_output = calc_diff(greedy_output, baseline_output)
     diff_greedy_req = calc_diff(greedy_requests, baseline_requests)
     print(
-        f"{'Greedy gain':<20} | {diff_greedy_total:>12} | {diff_greedy_output:>12} | {diff_greedy_req:>8}"
+        f"{'Greedy gain':<20} | {diff_greedy_total:>12} | {diff_greedy_output:>12} | {diff_greedy_req:>8}{phase_blank}"
     )
 
     # AHA flashinfer vs AHA baseline (shows flashinfer gain)
@@ -475,7 +590,7 @@ def print_comparison(
     diff_fi_output = calc_diff(fi_output, baseline_output)
     diff_fi_req = calc_diff(fi_requests, baseline_requests)
     print(
-        f"{'FlashInfer gain':<20} | {diff_fi_total:>12} | {diff_fi_output:>12} | {diff_fi_req:>8}"
+        f"{'FlashInfer gain':<20} | {diff_fi_total:>12} | {diff_fi_output:>12} | {diff_fi_req:>8}{phase_blank}"
     )
 
     # AHA flashinfer vs OLMo2 (end-to-end speedup over stock OLMo2)
@@ -483,7 +598,7 @@ def print_comparison(
     diff_fi_olmo_output = calc_diff(fi_output, olmo2_output)
     diff_fi_olmo_req = calc_diff(fi_requests, olmo2_requests)
     print(
-        f"{'FlashInfer vs OLMo2':<20} | {diff_fi_olmo_total:>12} | {diff_fi_olmo_output:>12} | {diff_fi_olmo_req:>8}"
+        f"{'FlashInfer vs OLMo2':<20} | {diff_fi_olmo_total:>12} | {diff_fi_olmo_output:>12} | {diff_fi_olmo_req:>8}{phase_blank}"
     )
 
     # Local-only vs OLMo2 (shows max possible gain)
@@ -491,7 +606,7 @@ def print_comparison(
     diff3_output = calc_diff(local_output, olmo2_output)
     diff3_req = calc_diff(local_requests, olmo2_requests)
     print(
-        f"{'Local-only speedup':<20} | {diff3_total:>12} | {diff3_output:>12} | {diff3_req:>8}"
+        f"{'Local-only speedup':<20} | {diff3_total:>12} | {diff3_output:>12} | {diff3_req:>8}{phase_blank}"
     )
 
     # AHA efficiency - how close AHA gets to local-only upper bound
@@ -511,31 +626,31 @@ def print_comparison(
     eff_output = calc_efficiency(optimized_output, olmo2_output, local_output)
     eff_req = calc_efficiency(optimized_requests, olmo2_requests, local_requests)
     print(
-        f"{'AHA opt efficiency':<20} | {eff_total:>12} | {eff_output:>12} | {eff_req:>8}"
+        f"{'AHA opt efficiency':<20} | {eff_total:>12} | {eff_output:>12} | {eff_req:>8}{phase_blank}"
     )
 
     eff_r_total = calc_efficiency(routed_total, olmo2_total, local_total)
     eff_r_output = calc_efficiency(routed_output, olmo2_output, local_output)
     eff_r_req = calc_efficiency(routed_requests, olmo2_requests, local_requests)
     print(
-        f"{'AHA routed eff':<20} | {eff_r_total:>12} | {eff_r_output:>12} | {eff_r_req:>8}"
+        f"{'AHA routed eff':<20} | {eff_r_total:>12} | {eff_r_output:>12} | {eff_r_req:>8}{phase_blank}"
     )
 
     eff_g_total = calc_efficiency(greedy_total, olmo2_total, local_total)
     eff_g_output = calc_efficiency(greedy_output, olmo2_output, local_output)
     eff_g_req = calc_efficiency(greedy_requests, olmo2_requests, local_requests)
     print(
-        f"{'AHA greedy eff':<20} | {eff_g_total:>12} | {eff_g_output:>12} | {eff_g_req:>8}"
+        f"{'AHA greedy eff':<20} | {eff_g_total:>12} | {eff_g_output:>12} | {eff_g_req:>8}{phase_blank}"
     )
 
     eff_f_total = calc_efficiency(fi_total, olmo2_total, local_total)
     eff_f_output = calc_efficiency(fi_output, olmo2_output, local_output)
     eff_f_req = calc_efficiency(fi_requests, olmo2_requests, local_requests)
     print(
-        f"{'AHA flashinfer eff':<20} | {eff_f_total:>12} | {eff_f_output:>12} | {eff_f_req:>8}"
+        f"{'AHA flashinfer eff':<20} | {eff_f_total:>12} | {eff_f_output:>12} | {eff_f_req:>8}{phase_blank}"
     )
 
-    print("=" * 60 + "\n")
+    print("=" * (60 + (34 if has_phases else 0)) + "\n")
 
     print("Legend:")
     print("  AHA overhead       = AHA (baseline) vs OLMo2 (negative = slower)")
@@ -581,6 +696,7 @@ def save_results(
             "input_len": args.input_len,
             "output_len": args.output_len,
             "max_num_seqs": args.max_num_seqs,
+            "measure_phases": getattr(args, "measure_phases", False),
         },
         "olmo2_baseline": olmo2_results,
         "aha_baseline": aha_baseline_results,
@@ -709,6 +825,16 @@ def main():
         "--save-results",
         action="store_true",
         help="Save results to benchmark_results.json",
+    )
+    parser.add_argument(
+        "--measure-phases",
+        action="store_true",
+        help=(
+            "Run a calibration pass with output_len=1 per variant to isolate "
+            "prefill time. Adds 'Prefill ms/tok' and 'Decode ms/tok' columns "
+            "to the summary. Roughly doubles per-variant runtime when input "
+            "length is short; ~1.05-1.2x overhead at long-context shapes."
+        ),
     )
     parser.add_argument(
         "--skip-olmo2", action="store_true", help="Skip OLMo2 baseline benchmark"
