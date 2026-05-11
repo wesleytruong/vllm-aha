@@ -478,6 +478,14 @@ def print_comparison(
         f"{'FlashInfer gain':<20} | {diff_fi_total:>12} | {diff_fi_output:>12} | {diff_fi_req:>8}"
     )
 
+    # AHA flashinfer vs OLMo2 (end-to-end speedup over stock OLMo2)
+    diff_fi_olmo_total = calc_diff(fi_total, olmo2_total)
+    diff_fi_olmo_output = calc_diff(fi_output, olmo2_output)
+    diff_fi_olmo_req = calc_diff(fi_requests, olmo2_requests)
+    print(
+        f"{'FlashInfer vs OLMo2':<20} | {diff_fi_olmo_total:>12} | {diff_fi_olmo_output:>12} | {diff_fi_olmo_req:>8}"
+    )
+
     # Local-only vs OLMo2 (shows max possible gain)
     diff3_total = calc_diff(local_total, olmo2_total)
     diff3_output = calc_diff(local_output, olmo2_output)
@@ -538,6 +546,9 @@ def print_comparison(
     print("  Greedy gain        = AHA (greedy) vs AHA (baseline) (positive = faster)")
     print(
         "  FlashInfer gain    = AHA (flashinfer) vs AHA (baseline) (positive = faster)"
+    )
+    print(
+        "  FlashInfer vs OLMo2= AHA (flashinfer) vs OLMo2 (end-to-end speedup over stock OLMo2)"
     )
     print("  Local-only speedup = Local-only vs OLMo2 (shows max possible gain)")
     print(
@@ -708,16 +719,16 @@ def main():
         help="Skip both AHA baseline and AHA optimized benchmarks",
     )
     parser.add_argument(
-        "--skip-aha-baseline", action="store_true", help="Skip AHA baseline benchmark"
+        "--skip-aha-baseline", action="store_true", help="Skip AHA baseline benchmark", default=True
     )
     parser.add_argument(
-        "--skip-aha-optimized", action="store_true", help="Skip AHA optimized benchmark"
+        "--skip-aha-optimized", action="store_true", help="Skip AHA optimized benchmark", default=True
     )
     parser.add_argument(
-        "--skip-aha-routed", action="store_true", help="Skip AHA routed benchmark"
+        "--skip-aha-routed", action="store_true", help="Skip AHA routed benchmark", default=True
     )
     parser.add_argument(
-        "--skip-aha-greedy", action="store_true", help="Skip AHA greedy benchmark"
+        "--skip-aha-greedy", action="store_true", help="Skip AHA greedy benchmark", default=True
     )
     parser.add_argument(
         "--skip-aha-flashinfer",
