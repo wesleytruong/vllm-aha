@@ -1,0 +1,121 @@
+# AHA-in-vLLM experiments
+
+Systems-engineering evaluation of **All-or-Here Attention (AHA)** — a learned
+per-head, per-token gate that routes each decode head between global (full) and
+local (128-token sliding-window) attention — integrated into vLLM v1 with a
+FlashInfer router decode kernel. These scripts measure where the kernel-level
+speedup goes end-to-end, and scale from a 32 GB RTX 5090 to an 80 GB+ H100/H200
+via a GPU-aware config (no per-run editing).
+
+> **Headline (5090, B=1):** the real gate prunes ~70–80% of heads to local and
+> delivers **~2.8–3.1× decode-attention** speedup, which dilutes by Amdahl to
+> **~1.2× e2e @8K → ~1.6× @32K**, growing toward the kernel ceiling at longer
+> context (the H100 experiment). All monotonic in routing fraction; controls
+> validated.
+
+## 0. Prerequisites (the two modified forks)
+
+This repo (`vllm-aha-wt`) is an **editable install of a modified vLLM**, and it
+depends on a **modified FlashInfer** fork (`../flashinfer`). Both carry AHA
+changes and must be present and installed editable on the cluster. The key
+edits:
+
+- vLLM: `vllm/model_executor/models/olmo2_aha.py` (the AHA model + cache-safe gate
+  override buffers), `vllm/v1/attention/backends/aha_flashinfer.py` (router decode
+  plan), `vllm/v1/attention/backends/flashinfer.py` (router scheduler path),
+  `vllm/config/compilation.py` + `vllm/transformers_utils/...` (config/registry).
+- FlashInfer: `flashinfer/decode.py`, `include/flashinfer/attention/prefill.cuh`
+  (per-head router/window in the tensor-core decode kernel).
+
+On the cluster, clone/sync the same forks and install editable:
+
+```bash
+cd vllm-aha-wt     && pip install -e . --no-build-isolation
+cd ../flashinfer   && pip install -e . --no-build-isolation   # JIT-compiles kernels on first use (needs CUDA + ninja)
+```
+
+`nsys` (Nsight Systems) is needed only for the kernel-direct sweep; the e2e and
+routing benchmarks are pure timing and need no profiler.
+
+## 1. Data
+
+The gate is content-dependent, so benchmarks use real PG-19 prose from
+`.benchmark_datasets/pg19-test_*.jsonl` (~22 MB). Either **rsync** the existing
+caches from the dev box (recommended, deterministic):
+
+```bash
+rsync -a <devbox>:.../vllm-aha-wt/.benchmark_datasets/ ./.benchmark_datasets/
+```
+
+or **regenerate** from Hugging Face:
+
+```bash
+python experiments/prepare_data.py --min-tokens 600000
+```
+
+## 2. GPU profile (auto-detected)
+
+`experiments/config.py` maps detected HBM → feasible contexts/batches/memory.
+Check what it picks (and override via `AHA_GPU_PROFILE`, `AHA_CONTEXTS`,
+`AHA_BATCHES`, `AHA_GPU_MEM`, `AHA_MODEL_MAX`):
+
+```bash
+python experiments/config.py
+# profile=h100 ... amdahl_contexts=[8192,16384,32768,65536,131072] ...
+```
+
+## 3. Run everything
+
+```bash
+sbatch experiments/slurm/run_all.sbatch      # edit env.sh first (repo path, modules, venv)
+```
+
+or individually (from the repo root):
+
+| Experiment | Command | Output |
+|---|---|---|
+| **Amdahl curve** (e2e speedup vs context) | `python experiments/bench_amdahl.py --batch 1` | `results/amdahl/` |
+| **Batch × e2e** throughput | `python experiments/bench_batch_e2e.py` | `results/batch_e2e/` |
+| **Kernel-direct** decode sweep (nsys) + overrides | `python experiments/run_kernel_sweep.py` | `results/nsys_cachefix/`, `…_direct.json` |
+| **Routing** fraction vs context | `python probe_aha_gate_vs_seqlen.py` | `/tmp/aha_gate_vs_seqlen.csv` |
+| **Figures/CSVs** | `python experiments/make_figures.py` | `results/figures/` |
+
+## 4. What each experiment shows
+
+- **Amdahl curve** — measured e2e decode speedup (real gate vs full attention)
+  rises with context as attention's share of the step grows, toward the kernel
+  ceiling. `amdahl_curve.csv` columns: context, batch, e2e_speedup,
+  alllocal_ceiling, real/full tok/s, routing %.
+- **Batch × e2e** — net of two competing effects: fixed per-step CPU/scheduling
+  overhead amortizes with batch (helps), while the decode-attention kernel
+  speedup erodes with batch (hurts).
+- **Kernel-direct** — isolates the decode attention kernel per step (nsys, last
+  `n_layers·(mt−1)` launches by start time = decode, robust to chunked-prefill
+  remainders). Configs are monotonic in routing fraction; `dense-fi ≈ aha-global`
+  validates the full-attention control. Each cell logs measured SWA% (routing).
+- **Routing** — the gate's local-routing fraction vs sequence length (per-layer).
+
+## Quality validation (planned, not in this suite)
+
+Quality is evaluated by running the **AHA paper's own benchmarks** through this
+vLLM integration via `lm-evaluation-harness` (`--model vllm`,
+`pretrained=xuan-luo/AHA-OLMO2,...`), real gate vs forced `all-global`. Note the
+integration gates **decode only** (prefill = full attention), while the paper
+gates *all* tokens — so only the paper's **generation** tasks (GSM8K, MBPP,
+MultiNews) exercise our gate; the multiple-choice tasks (MMLU, HellaSwag, CSQA)
+are loglikelihood/prefill-scored and read as full-attention (no-regression
+check). See the project notes for this fidelity-gap discussion.
+
+## 5. Notes / gotchas
+
+- **Gate override is cache-safe.** `VLLM_AHA_GATE_OVERRIDE=global|local|half`
+  forces routing for the ablations; it is applied via runtime buffers, so the
+  torch.compile cache is correct with no flag. (Historical bug: it used to be
+  baked into the compiled graph and served stale from cache — fixed.) The
+  benches flip it in-process via `collective_rpc` for clean A/B with no reload.
+- **Run from the repo root** so scripts find `.benchmark_datasets/` and the root
+  harness scripts.
+- **OOM at large context×batch** — lower `AHA_GPU_MEM` or trim `AHA_BATCHES`;
+  KV = 128 KB/token, so context×batch must fit `~gpu_mem·HBM − weights`.
+- The model is **AHA-OLMO2** (`xuan-luo/AHA-OLMO2`): 16 layers, 16 KV-heads,
+  head_dim 128, MHA, fp16.
