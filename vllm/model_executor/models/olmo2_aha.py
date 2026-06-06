@@ -1379,6 +1379,27 @@ class _AHAFlashInferAttention(nn.Module):
             "_probe_decode_calls", torch.zeros(1, dtype=torch.long),
             persistent=False)
 
+        # Gate-override as BUFFERS, not a baked Python branch. _apply_gate_override
+        # reads the module-global _GATE_OVERRIDE inside the compiled region, so
+        # Dynamo bakes the chosen branch into the artifact — and vLLM's compile
+        # cache key does NOT include _GATE_OVERRIDE, so a cached graph baked with
+        # one override (or None) is silently reused for any other. That made every
+        # override experiment a no-op unless the cache was disabled. Encoding the
+        # override as buffers makes it runtime DATA (graph inputs): one compiled
+        # graph serves all modes, the cache is correct, and `none` is an exact
+        # no-op (keep=1, force=0 → gate_hard unchanged). Applied at gate compute.
+        #   gate_hard = gate_hard * _gate_keep + _gate_force
+        _keep = 0.0 if _GATE_OVERRIDE in ("global", "local", "half") else 1.0
+        _force = torch.zeros(self.num_heads, dtype=torch.float32)
+        if _GATE_OVERRIDE == "global":
+            _force[:] = 1.0
+        elif _GATE_OVERRIDE == "half":
+            _force[::2] = 1.0  # even heads → global(1), odd → local(0)
+        self.register_buffer(
+            "_gate_keep", torch.tensor(_keep, dtype=torch.float32),
+            persistent=False)
+        self.register_buffer("_gate_force", _force, persistent=False)
+
         # Register so the dispatch custom op can recover this instance at runtime
         # from the layer_name string (it can't capture `self`).
         register_aha_fi(self.kv_cache_attn.layer_name, self)
@@ -1420,8 +1441,11 @@ class _AHAFlashInferAttention(nn.Module):
         # NOT happen here — it goes through the opaque custom op below, otherwise
         # Dynamo bakes the branch at trace time and the router never runs.
         gate_sigmoid = torch.sigmoid(gate)
-        gate_hard = _apply_gate_override(
-            (gate_sigmoid > 0.5).to(hidden_states.dtype))
+        gate_hard = (gate_sigmoid > 0.5).to(hidden_states.dtype)
+        # Cache-safe gate override via buffers (see __init__). For the default
+        # (no override) this is exactly gate_hard*1 + 0 = gate_hard.
+        gate_hard = (gate_hard * self._gate_keep.to(gate_hard.dtype)
+                     + self._gate_force.to(gate_hard.dtype))
 
         N = q.shape[0]
         output = torch.empty(
