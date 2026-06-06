@@ -59,6 +59,7 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.sequence import IntermediateTensors
+from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.fa_utils import (
     flash_attn_varlen_func,
     reshape_and_cache_flash,
@@ -67,10 +68,131 @@ from vllm.v1.attention.backends.aha_flashinfer import AHAFlashInferBackend
 
 logger = init_logger(__name__)
 
+
+# ── Gate-routing probe (survives torch.compile + cudagraph) ──────────────────
+# In-place buffer adds inside the compiled forward get functionalized away by
+# inductor, and eager mode crashes for the FI path — so accumulate via a custom
+# op, which the compiler treats as opaque and preserves (mutations declared).
+@torch.library.custom_op(
+    "aha::probe_accumulate",
+    mutates_args=("swa_buf", "total_buf", "calls_buf"),
+)
+def _probe_accumulate(
+    router: torch.Tensor,
+    swa_buf: torch.Tensor,
+    total_buf: torch.Tensor,
+    calls_buf: torch.Tensor,
+) -> None:
+    # router uint8 is head_uses_swa: 1 → LOCAL (SWA), 0 → GLOBAL.
+    swa_buf.add_((router == 1).sum().to(torch.long))
+    total_buf.add_(router.numel())
+    calls_buf.add_(1)
+
+
+@_probe_accumulate.register_fake
+def _(router, swa_buf, total_buf, calls_buf) -> None:
+    return None
+
+
+@torch.library.custom_op("aha::probe_bump", mutates_args=("buf",))
+def _probe_bump(buf: torch.Tensor) -> None:
+    buf.add_(1)
+
+
+@_probe_bump.register_fake
+def _(buf) -> None:
+    return None
+
+
+# ── AHA FlashInfer dispatch custom op ────────────────────────────────────────
+# The prefill/decode branch MUST live inside an opaque custom op. Otherwise
+# Dynamo (FAOlmoModel is @support_torch_compile) evaluates it at trace time off
+# Python-int metadata fetched from the forward-context global, bakes the result,
+# and dead-code-eliminates the router path — so AHA's router never runs. Wrapping
+# the dispatch in a custom op moves the branch back to runtime, mirroring vLLM's
+# own torch.ops.vllm.unified_attention_with_output. (See the sibling Qwen3 plugin
+# aha_paged_op.py, whose docstring describes this exact failure mode.)
+#
+# Registry maps the canonical attention layer_name → module instance so the op
+# can recover `self` from the string it's allowed to take.
+_AHA_FI_REGISTRY: dict[str, nn.Module] = {}
+
+
+def register_aha_fi(layer_name: str, module: nn.Module) -> None:
+    _AHA_FI_REGISTRY[layer_name] = module
+
+
+def _aha_fi_attention_impl(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    gate_hard: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    """Runtime impl (opaque to Dynamo): dispatch prefill vs decode and write the
+    pre-o_proj attention output into `output` in-place."""
+    module = _AHA_FI_REGISTRY[layer_name]
+    result = module._runtime_dispatch(q, k, v, gate_hard, output)
+    # Hot decode path writes into `output` and returns None; the prefill / warmup
+    # fallback returns a fresh tensor that we copy once.
+    if result is not None:
+        output.copy_(result)
+
+
+def _aha_fi_attention_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    gate_hard: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    return None
+
+
+direct_register_custom_op(
+    op_name="aha_fi_attention_with_output",
+    op_func=_aha_fi_attention_impl,
+    mutates_args=["output"],
+    fake_impl=_aha_fi_attention_fake,
+)
+
+# Qualified name added to CompilationConfig._attention_ops (in compilation.py) so
+# torch.compile treats it as an attention split boundary, like
+# vllm::unified_attention_with_output.
+AHA_FI_SPLITTING_OP = "vllm::aha_fi_attention_with_output"
+
+
 # ── Gate statistics logging ──────────────────────────────────────────────────
 _GATE_STATS_ENABLED = bool(os.environ.get("VLLM_AHA_GATE_STATS"))
 _gate_stats_counter = 0
 _GATE_STATS_INTERVAL = int(os.environ.get("VLLM_AHA_GATE_STATS_INTERVAL", "100"))
+
+# ── Gate override (A/C/D decomposition: force all heads global or local) ──────
+# VLLM_AHA_GATE_OVERRIDE: unset (default) | "global" | "local" | "half".
+# "global": every head → full attention (config-C, isolates router overhead);
+# "local":  every head → sliding-window;
+# "half":   deterministic 50% pattern — even-indexed heads global, odd-indexed
+#           local. Matches the Bernoulli(0.5) test in the FlashInfer microbench
+#           and isolates "would the kernel reward per-head pruning?" from "is
+#           the learned gate routing aggressively enough?".
+_GATE_OVERRIDE = os.environ.get("VLLM_AHA_GATE_OVERRIDE")
+
+
+def _apply_gate_override(gate_hard: torch.Tensor) -> torch.Tensor:
+    if _GATE_OVERRIDE == "global":
+        return torch.ones_like(gate_hard)
+    if _GATE_OVERRIDE == "local":
+        return torch.zeros_like(gate_hard)
+    if _GATE_OVERRIDE == "half":
+        # gate_hard shape: (..., num_heads). Even heads → 1 (global), odd → 0.
+        h = gate_hard.shape[-1]
+        pat = torch.zeros(h, dtype=gate_hard.dtype, device=gate_hard.device)
+        pat[::2] = 1
+        return pat.expand_as(gate_hard).contiguous()
+    return gate_hard
+
 
 # ── Phase timing ─────────────────────────────────────────────────────────────
 _TIMING_ENABLED = bool(os.environ.get("VLLM_AHA_TIMING"))
@@ -249,7 +371,7 @@ class _AHADualAttention(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
 
         gate_sigmoid = torch.sigmoid(gate)
-        gate_hard = (gate_sigmoid > 0.5).to(hidden_states.dtype)
+        gate_hard = _apply_gate_override((gate_sigmoid > 0.5).to(hidden_states.dtype))
 
         global_output = self.global_attn(q, k, v)
         local_output = self.local_attn(q, None, None)
@@ -403,7 +525,7 @@ class _AHARoutedAttention(nn.Module):
             return self._forward_prefill_full(q, k, v)
         else:
             gate_sigmoid = torch.sigmoid(gate)
-            gate_hard = (gate_sigmoid > 0.5).to(hidden_states.dtype)
+            gate_hard = _apply_gate_override((gate_sigmoid > 0.5).to(hidden_states.dtype))
 
             if _GATE_STATS_ENABLED:
                 self._log_gate_stats(gate_hard)
@@ -857,7 +979,7 @@ class _AHAGreedyAttention(nn.Module):
             return self._forward_prefill_full(q, k, v)
         else:
             gate_sigmoid = torch.sigmoid(gate)
-            gate_hard = (gate_sigmoid > 0.5).to(hidden_states.dtype)
+            gate_hard = _apply_gate_override((gate_sigmoid > 0.5).to(hidden_states.dtype))
 
             if _GATE_STATS_ENABLED:
                 self._log_gate_stats(gate_hard)
@@ -1238,6 +1360,29 @@ class _AHAFlashInferAttention(nn.Module):
 
         self._prefix = prefix
 
+        # In-graph gate-routing probe accumulators. Live as buffers (not Python
+        # side-effects) so they survive torch.compile + CUDA graph replay — the
+        # only way to observe real-gate routing under the production path (the
+        # gate-stats prints fire only in eager, and the FI eager path crashes).
+        # Read/reset via collective_rpc from probe_aha_gate_vs_seqlen.py.
+        #   _probe_swa_sum : count of (token,head) slots routed LOCAL (gate==0)
+        #   _probe_total   : total (token,head) slots seen in decode
+        #   _probe_forward_calls / _probe_decode_calls : call counters
+        self.register_buffer(
+            "_probe_swa_sum", torch.zeros(1, dtype=torch.long), persistent=False)
+        self.register_buffer(
+            "_probe_total", torch.zeros(1, dtype=torch.long), persistent=False)
+        self.register_buffer(
+            "_probe_forward_calls", torch.zeros(1, dtype=torch.long),
+            persistent=False)
+        self.register_buffer(
+            "_probe_decode_calls", torch.zeros(1, dtype=torch.long),
+            persistent=False)
+
+        # Register so the dispatch custom op can recover this instance at runtime
+        # from the layer_name string (it can't capture `self`).
+        register_aha_fi(self.kv_cache_attn.layer_name, self)
+
     def _apply_qk_norm(
         self, q: torch.Tensor, k: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1270,14 +1415,41 @@ class _AHAFlashInferAttention(nn.Module):
         q, k = self._apply_qk_norm(q, k)
         q, k = self.rotary_emb(positions, q, k)
 
+        # Gate is shape-deterministic, so compute it unconditionally here (in the
+        # compiled region). The metadata-dependent prefill/decode dispatch must
+        # NOT happen here — it goes through the opaque custom op below, otherwise
+        # Dynamo bakes the branch at trace time and the router never runs.
+        gate_sigmoid = torch.sigmoid(gate)
+        gate_hard = _apply_gate_override(
+            (gate_sigmoid > 0.5).to(hidden_states.dtype))
+
+        N = q.shape[0]
+        output = torch.empty(
+            (N, self.num_heads * self.head_dim),
+            dtype=q.dtype, device=q.device)
+        torch.ops.vllm.aha_fi_attention_with_output(
+            q, k, v, gate_hard, output, self.kv_cache_attn.layer_name)
+
+        output_final, _ = self.o_proj(output)
+        return output_final
+
+    def _runtime_dispatch(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        gate_hard: torch.Tensor,
+        output: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Runs inside the custom op (opaque to Dynamo), so this branch is
+        evaluated at runtime against the live metadata. Pure-decode writes the
+        pre-o_proj attention output into `output` and returns None; prefill /
+        warmup returns a fresh tensor for the op to copy in.
+        """
         attn_metadata, attn_layer, kv_cache = get_attention_context(
             self.kv_cache_attn.layer_name
         )
 
-        # Pure-decode only routes through the router kernel; anything with
-        # prefill tokens (including mixed batches) goes through the standard
-        # FlashInfer backend via self.kv_cache_attn(q, k, v), which handles
-        # the KV write + full-attention internally.
         is_pure_decode = (
             attn_metadata is not None
             and attn_metadata.num_prefills == 0
@@ -1285,27 +1457,15 @@ class _AHAFlashInferAttention(nn.Module):
         )
 
         if not is_pure_decode:
-            return self._forward_prefill_full(q, k, v)
-        else:
-            gate_sigmoid = torch.sigmoid(gate)
-            gate_hard = (gate_sigmoid > 0.5).to(hidden_states.dtype)
+            # Prefill / warmup: full attention via the standard vLLM Attention
+            # (handles its own KV write). Returns pre-o_proj output to copy.
+            return self.kv_cache_attn(q, k, v)
 
-            if _GATE_STATS_ENABLED:
-                self._log_gate_stats(gate_hard)
-
-            return self._forward_decode_flashinfer(
-                q, k, v, gate_hard, attn_metadata, attn_layer, kv_cache
-            )
-
-    def _forward_prefill_full(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-    ) -> torch.Tensor:
-        attn_output = self.kv_cache_attn(q, k, v)
-        output, _ = self.o_proj(attn_output)
-        return output
+        if _GATE_STATS_ENABLED:
+            self._log_gate_stats(gate_hard)
+        self._forward_decode_flashinfer(
+            q, k, v, gate_hard, attn_metadata, attn_layer, kv_cache, output)
+        return None
 
     def _forward_decode_flashinfer(
         self,
@@ -1316,7 +1476,8 @@ class _AHAFlashInferAttention(nn.Module):
         attn_metadata,
         attn_layer,
         kv_cache: torch.Tensor,
-    ) -> torch.Tensor:
+        output: torch.Tensor,
+    ) -> None:
         N = q.shape[0]
         q = q.view(N, self.num_heads, self.head_dim)
         k = k.view(N, self.num_kv_heads, self.head_dim)
@@ -1339,17 +1500,39 @@ class _AHAFlashInferAttention(nn.Module):
             "(num_heads == num_kv_heads). Got num_queries_per_kv="
             f"{self.num_queries_per_kv}. GQA support requires a reduction rule."
         )
-        router = gate_hard.to(torch.uint8).contiguous()
-
         router_wrapper = attn_metadata.router_decode_wrapper
         assert router_wrapper is not None
-        output = router_wrapper.run(
+
+        # Persistent, per-wrapper router buffer. Under cudagraph the attention
+        # kernel reads the router at the pointer captured at capture time (frozen
+        # address, live contents). A fresh per-step allocation
+        # (gate_hard.to(uint8)) lands at a new address each step, so the captured
+        # kernel keeps reading the stale capture-time buffer and per-step routing
+        # is silently ignored — every replay reuses the captured pattern, giving
+        # flat, context-independent timing with global == local. Writing in place
+        # into a stable buffer the graph captured is what makes routing take
+        # effect under cudagraph. (The wrapper is per-cudagraph-batch-size and
+        # shared across layers; stream ordering serializes write→run per layer.)
+        router = getattr(router_wrapper, "_aha_router_buf", None)
+        if router is None or router.shape != (N, self.num_kv_heads):
+            router = torch.empty(
+                N, self.num_kv_heads, dtype=torch.uint8, device=q.device)
+            router_wrapper._aha_router_buf = router
+        # Polarity: FlashInfer treats router == 1 as SWA/local; our gate_hard == 1
+        # is GLOBAL (full attention), so the local/SWA heads are gate_hard == 0.
+        router.copy_((gate_hard == 0).to(torch.uint8))
+
+        # In-graph routing probe (custom op → survives compile + cudagraph).
+        torch.ops.aha.probe_accumulate(
+            router, self._probe_swa_sum, self._probe_total,
+            self._probe_decode_calls)
+
+        attn_out = router_wrapper.run(
             q, (key_cache, value_cache), router=router,
         )
 
-        attn_output = output.view(N, -1)
-        output_final, _ = self.o_proj(attn_output)
-        return output_final
+        # Write the pre-o_proj attention output into the op's output buffer.
+        output.copy_(attn_out.view(N, -1))
 
     @torch.compiler.disable
     def _log_gate_stats(self, gate_hard: torch.Tensor) -> None:
@@ -1357,10 +1540,11 @@ class _AHAFlashInferAttention(nn.Module):
         _gate_stats_counter += 1
         if _gate_stats_counter % _GATE_STATS_INTERVAL != 0:
             return
-        swa_frac = gate_hard.float().mean().item()
+        # gate_hard == 1 routes to global (full); == 0 routes to local (SWA).
+        full_frac = gate_hard.float().mean().item()
         print(
             f"[fi router stats] {self._prefix} step={_gate_stats_counter} "
-            f"SWA={swa_frac*100:.1f}% full={(1-swa_frac)*100:.1f}% "
+            f"full={full_frac*100:.1f}% SWA={(1-full_frac)*100:.1f}% "
             f"shape={tuple(gate_hard.shape)}",
             flush=True,
         )

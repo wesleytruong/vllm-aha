@@ -630,6 +630,9 @@ class CompilationConfig:
         "vllm::kda_attention",
         "vllm::sparse_attn_indexer",
         "vllm::rocm_aiter_sparse_attn_indexer",
+        # AHA-OLMo2 FlashInfer dispatch op (see olmo2_aha.py): must be a split
+        # boundary so torch.compile treats its prefill/decode branch as opaque.
+        "vllm::aha_fi_attention_with_output",
     ]
 
     def compute_hash(self) -> str:
