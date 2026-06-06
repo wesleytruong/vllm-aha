@@ -184,6 +184,30 @@ class AHAFlashInferMetadataBuilder(FlashInferMetadataBuilder):
                 kv_data_type=self.kv_cache_dtype,
             )
             attn_metadata.router_decode_wrapper = router_wrapper  # type: ignore[attr-defined]
+
+            import os as _os
+            if _os.environ.get("VLLM_AHA_DUMP_PLAN") == "1":
+                rw = router_wrapper
+                pi = getattr(rw, "_plan_info", None)
+                try:
+                    pi_repr = list(pi) if pi is not None else None
+                except TypeError:
+                    pi_repr = repr(pi)
+                _sl = int(seq_lens_cpu[0]) if len(seq_lens_cpu) else -1
+                if _sl > 1000:  # only the real long-context decode
+                    from vllm.v1.attention.backends.utils import (
+                        get_kv_cache_layout as _gkl,
+                    )
+                    print(
+                        f"[aha plan dump] seq_len={_sl} backend={getattr(rw, '_backend', '?')} "
+                        f"layout={_gkl()} use_cudagraph={use_cudagraph} bs={num_input_tokens} "
+                        f"qo={self.num_qo_heads} kv={self.num_kv_heads} hd={self.head_dim} "
+                        f"page={self.page_size} runtime_win={getattr(rw, '_window_left', '?')} "
+                        f"use_tc={getattr(rw, '_use_tensor_cores', '?')} "
+                        f"use_router={getattr(rw, '_use_router', '?')} "
+                        f"num_pages={num_actual_pages} plan_info={pi_repr}",
+                        flush=True,
+                    )
         else:
             attn_metadata.router_decode_wrapper = None  # type: ignore[attr-defined]
 

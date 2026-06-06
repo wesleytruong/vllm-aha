@@ -1689,7 +1689,13 @@ def fast_plan_decode(
             head_dim,
             head_dim,
             False,  # causal
-            window_left,
+            # AHA router: the scheduler/3D-split must partition the FULL KV
+            # (-1), and the per-head SWA window is applied at run time via the
+            # router mask (self._window_left stays unchanged). Mirrors the
+            # `-1 if self._use_router` correction in self.plan (FlashInfer fork
+            # decode.py). Without this, the cudagraph fast-path schedules only
+            # the last `window_left` tokens and global heads are truncated.
+            -1 if getattr(self, "_use_router", False) else window_left,
         ]
         if self._backend == "fa2":
             args.append(fixed_split_size)
