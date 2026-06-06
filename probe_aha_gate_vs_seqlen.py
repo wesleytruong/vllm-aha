@@ -26,28 +26,40 @@ from vllm import LLM, SamplingParams
 from vllm.model_executor.models.olmo2_aha import _AHAFlashInferAttention
 
 MODEL = "xuan-luo/AHA-OLMO2"
-MAX_MODEL_LEN = 32000
+MAX_MODEL_LEN = 33000
 GPU_MEM = float(os.environ.get("PROBE_GPU_MEM", "0.55"))
 DECODE_TOKENS = 64
-PROMPT_LENS = [512, 2048, 4096, 8192, 16384, 24000]
+PROMPT_LENS = [512, 2048, 8192, 16384, 32768]
 
 
 def _load_pg19_tokens(tokenizer, min_tokens: int) -> list[int]:
-    """Stream PG-19 test books, concatenate until we have enough tokens."""
-    from datasets import load_dataset
-    ds = load_dataset(
-        "deepmind/pg19", split="test", streaming=True, trust_remote_code=True
+    """Concatenate PG-19 prose from the .benchmark_datasets/ JSONL caches
+    (the HF `deepmind/pg19` script-based loader no longer works on recent
+    `datasets`)."""
+    import glob
+    import json
+    jsonl_files = sorted(
+        glob.glob(".benchmark_datasets/pg19-test_*.jsonl"),
+        key=lambda p: -os.path.getsize(p),
     )
+    if not jsonl_files:
+        raise RuntimeError(
+            "no .benchmark_datasets/pg19-test_*.jsonl found; "
+            "run benchmark_aha_full.py once to populate the cache."
+        )
     buf: list[int] = []
-    for record in ds:
-        text = record["text"]
-        ids = tokenizer(text, add_special_tokens=False).input_ids
-        buf.extend(ids)
-        if len(buf) >= min_tokens:
-            break
+    for path in jsonl_files:
+        with open(path) as f:
+            for line in f:
+                txt = json.loads(line).get("prompt", "")
+                if not txt:
+                    continue
+                buf.extend(tokenizer(txt, add_special_tokens=False).input_ids)
+                if len(buf) >= min_tokens:
+                    return buf
     if len(buf) < min_tokens:
         raise RuntimeError(
-            f"PG-19 streaming exhausted with only {len(buf)} tokens "
+            f"PG-19 JSONL caches exhausted with only {len(buf)} tokens "
             f"(needed {min_tokens})"
         )
     return buf
@@ -95,7 +107,9 @@ def main():
             "max_position_embeddings": MAX_MODEL_LEN,
         },
         disable_log_stats=True,
-        enforce_eager=True,
+        enforce_eager=False,  # graphs ON (FI eager path crashes). The probe
+                              # accumulation is a side-effecting custom op so it
+                              # survives torch.compile + cudagraph replay.
         max_num_seqs=16,
     )
 
