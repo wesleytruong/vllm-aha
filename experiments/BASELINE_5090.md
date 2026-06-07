@@ -41,7 +41,7 @@ vs context (B=1): **1.21× @8K → 1.46× @16K → 1.59× @32K** (all-local ceil
 
 | ctx | B=1 | B=2 | B=4 | B=8 | B=16 |
 |---|--:|--:|--:|--:|--:|
-| 8K | 1.31× | — | 1.54× | 1.79× | **2.35×** |
+| 8K | 1.31× | 1.32× | 1.54× | 1.79× | **2.35×** |
 | 32K | 1.25× | 2.04× | **2.10×** | — | — |
 
 Unlike the kernel, e2e throughput speedup **grows** with batch (the fixed
