@@ -43,6 +43,14 @@ vs context (B=1): **1.21× @8K → 1.46× @16K → 1.59× @32K** (all-local ceil
 |---|--:|--:|--:|--:|--:|
 | 8K | 1.31× | 1.32× | 1.54× | 1.79× | **2.35×** |
 | 32K | 1.25× | 2.04× | **2.10×** | — | — |
+| 64K | **2.02×** | — | — | — | — |
+
+(64K KV = 8 GB/seq; needs `AHA_GPU_MEM=0.6` so the 64K transient prefill/decode
+workspace fits — at 0.8 it OOMs, at 0.5 the tight pool inflates `all-global`.
+B≥2 at 64K is near the 32 GB card's limit; the H100's 80 GB lifts this.) B=1
+e2e carries ~20% run-to-run noise (the fixed per-step overhead), so read the
+trend, not the third digit: real-gate e2e grows with context — ~1.3× @8K →
+~1.3–1.6× @32K → **~2.0× @64K** — as attention takes over the decode step.
 
 Unlike the kernel, e2e throughput speedup **grows** with batch (the fixed
 ~2.2 ms/step CPU/scheduling overhead amortizes faster than the kernel advantage
