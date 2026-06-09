@@ -115,6 +115,7 @@ def main():
         # decode; everything earlier is prefill. Robust to chunked-prefill
         # remainders and to fast (pruned) decode launches.
         sd = kernel_start_dur(rows, ATTN_KERNEL)
+        merge = kernel_durs(rows, MERGE_KERNEL)  # split-KV reduction (decode-only)
         expected = args.n_layers * steps
         if len(sd) < expected:
             print(f"WARN {fn}: only {len(sd)} attn launches (< expected decode "
