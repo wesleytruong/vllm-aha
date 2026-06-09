@@ -24,15 +24,32 @@ per-launch speedup vs full: real-gate **1.3× @8K, ~6× @32K**; all-local 2.2× 
 Mechanism: windowing makes the kernel context-flat; full attention scales 18→190 µs.
 
 ## Level 2 — Kernel-in-engine (nsys decode-direct, µs/step, real gate)
-`experiments/run_kernel_sweep.py`. Monotonic in routing fraction;
-`dense-fi ≈ aha-global` validates the full-attention control.
+`experiments/run_kernel_sweep.py`. Baseline = true base FlashInfer (`dense-fi`,
+stock model, full attention); `dense-fi ≈ aha-global` (≤4%) validates the
+full-attention control. **Decode is isolated by priming the prompt into the
+prefix cache before the profiler window** (`AHA_PFC_DECODE=1`) — the captured
+`generate` is a pure cache hit, so the trace holds only decode-shaped launches at
+ANY batch (no chunked-prefill interleave to separate). Speedup = baseFI ÷ real.
 
-| ctx | all-global | half | **real gate** | all-local | batch-scaling (real/full) |
+| ctx | B | baseFI | **real gate** | native-SWA | **speedup** |
 |---|--:|--:|--:|--:|--|
-| 8K | 809 | 436 | **258 (3.13×)** | 114 | 2.96 / 2.48 / 2.08× @ B=4/8/16 |
-| 32K | 2656 | 1396 | **957 (2.78×)** | 115 | 2.38 / 2.01× @ B=2/4 |
+| 8K | 1 | 754 | **259** | 104 | **2.92×** |
+| 8K | 4 | 2651 | **765** | 159 | **3.46×** |
+| 8K | 8 | 5200 | **1583** | 196 | **3.28×** |
+| 8K | 16 | 10316 | **3111** | 271 | **3.32×** |
+| 16K | 1 | 1398 | **515** | 104 | **2.71×** |
+| 16K | 4 | 5196 | **1925** | 160 | **2.70×** |
+| 16K | 8 | 10313 | **3494** | 196 | **2.95×** |
+| 32K | 1 | 2715 | **955** | 104 | **2.84×** |
+| 32K | 2 | 5934 | **1806** | 148 | **3.29×** |
+| 32K | 4 | 11710 | **3672** | 157 | **3.19×** |
 
-Routing: 79% local @8K, 68% @32K. Speedup **erodes with batch** at the kernel level.
+Routing: 79% local @8K, 68% @32K. Real-gate speedup is **flat ~2.7–3.5× across
+batch** (both baseFI and real scale ~linearly with B, so the ratio holds) — the
+earlier "erodes with batch" reading was a chunked-prefill contamination artifact
+in the B>1 trace, removed by the prefix-cache isolation above. native-SWA is the
+pure-windowing floor (unreachable by mixed per-head routing) — its ratio to base
+balloons with B (it stays ~context-flat), so it is a ceiling, not a target.
 
 ## Level 3 — End-to-end (tokens/s)
 `experiments/bench_amdahl.py`, `experiments/bench_batch_e2e.py`.
@@ -52,15 +69,17 @@ e2e carries ~20% run-to-run noise (the fixed per-step overhead), so read the
 trend, not the third digit: real-gate e2e grows with context — ~1.3× @8K →
 ~1.3–1.6× @32K → **~2.0× @64K** — as attention takes over the decode step.
 
-Unlike the kernel, e2e throughput speedup **grows** with batch (the fixed
-~2.2 ms/step CPU/scheduling overhead amortizes faster than the kernel advantage
-erodes). AHA is a throughput-regime win at e2e.
+e2e throughput speedup **grows** with batch: the kernel advantage is ~flat in
+batch (Level 2), while the fixed ~2.2 ms/step CPU/scheduling overhead amortizes
+as B rises, so its Amdahl drag shrinks and more of the kernel win lands. AHA is a
+throughput-regime win at e2e.
 
 ## Why the ratios differ across levels (state this explicitly)
 - **L1 → L2:** L1 uses a *uniform* 70%-local pattern and excludes the merge
   kernel + engine overhead (overstates: ~6× @32K). L2 uses the *real,
   heterogeneous* gate (some layers route mostly global, dragging the average) and
-  includes merge — so the honest realized number is 2.78×. **L2 is the product number.**
+  includes merge — so the honest realized number is ~2.7–3.5× (2.84× @32K B=1).
+  **L2 is the product number.**
 - **L2 → L3:** decode-attention is only part of the step (≈26% @8K, ≈53% @32K);
   Amdahl dilutes 2.8–3.1× → 1.2–1.6× e2e at B=1; batching amortizes the fixed
   overhead back up to ~2.3×.

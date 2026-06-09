@@ -88,13 +88,16 @@ or individually (from the repo root):
   rises with context as attention's share of the step grows, toward the kernel
   ceiling. `amdahl_curve.csv` columns: context, batch, e2e_speedup,
   alllocal_ceiling, real/full tok/s, routing %.
-- **Batch × e2e** — net of two competing effects: fixed per-step CPU/scheduling
-  overhead amortizes with batch (helps), while the decode-attention kernel
-  speedup erodes with batch (hurts).
-- **Kernel-direct** — isolates the decode attention kernel per step (nsys, last
-  `n_layers·(mt−1)` launches by start time = decode, robust to chunked-prefill
-  remainders). Configs are monotonic in routing fraction; `dense-fi ≈ aha-global`
-  validates the full-attention control. Each cell logs measured SWA% (routing).
+- **Batch × e2e** — fixed per-step CPU/scheduling overhead amortizes with batch,
+  so e2e gain *grows* with batch; the decode-attention kernel speedup itself is
+  roughly flat in batch (see Kernel-direct), not eroding.
+- **Kernel-direct** — isolates the decode attention kernel per step (nsys). The
+  prompt is primed into the prefix cache *before* the profiler window
+  (`AHA_PFC_DECODE=1`), so the captured `generate` is a pure cache hit and the
+  trace contains only decode-shaped launches — clean decode isolation at ANY
+  batch (no chunked-prefill interleave to subtract). Real-gate decode speedup is
+  a flat ~2.7–3.5× across B=1→16; `dense-fi ≈ aha-global` validates the
+  full-attention control. Each cell logs measured SWA% (routing).
 - **Routing** — the gate's local-routing fraction vs sequence length (per-layer).
 
 ## Quality validation (planned, not in this suite)

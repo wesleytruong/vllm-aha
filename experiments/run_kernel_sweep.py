@@ -24,7 +24,8 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 from config import get_config  # noqa: E402
 
-CFGS = ["dense-fi", "aha-global", "aha-local", "aha-half", "aha-flashinfer"]
+CFGS = ["dense-fi", "aha-global", "aha-local", "aha-half", "aha-flashinfer",
+        "local-only"]  # local-only = true native-SWA ceiling (kernel_summary)
 
 
 def main():
@@ -44,6 +45,9 @@ def main():
           f"ctx_batches={ctx_batches}", flush=True)
     env = os.environ.copy()
     env["VLLM_AHA_PROBE_READOUT"] = "1"  # record routing per cell
+    env["AHA_PFC_DECODE"] = "1"          # prefix-cache prime -> clean decode-only
+    #                                      trace (isolates decode at B>1; prefill
+    #                                      otherwise interleaves and contaminates).
 
     for ctx, batches in ctx_batches.items():
         model_max = max(cfg["model_max"], ctx + 256)

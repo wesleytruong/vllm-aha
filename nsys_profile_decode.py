@@ -28,6 +28,12 @@ CFG = os.environ.get("AHA_CFG", "aha-flashinfer")
 INPUT_LEN = int(os.environ.get("INPUT_LEN", "8192"))
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "33"))
 BATCH = int(os.environ.get("AHA_BATCH", "1"))
+# AHA_PFC_DECODE=1: prime the full prompt into the prefix cache BEFORE the
+# profiler window, so the profiled generate is a cache hit (no prefill recompute)
+# -> the nsys trace contains ONLY decode-shaped launches. This isolates the
+# decode phase cleanly at B>1, where chunked-prefill otherwise interleaves with
+# decode and contaminates the decode-direct extraction.
+_PFC = os.environ.get("AHA_PFC_DECODE") == "1"
 MODEL_MAX = int(os.environ.get("AHA_MODEL_MAX", "32768"))
 GPU_MEM = float(os.environ.get("AHA_GPU_MEM", "0.5"))  # bump for long-ctx KV
 
@@ -133,7 +139,7 @@ llm_kwargs = dict(
     hf_overrides=cfg["overrides"],
     disable_log_stats=True,
     enforce_eager=False,           # graphs ON — production path
-    enable_prefix_caching=False,   # so warmup prefix doesn't taint main prefill
+    enable_prefix_caching=_PFC,    # PFC mode: prime the prompt so profiled gen is cache-hit
     max_num_seqs=max(BATCH, 4),    # must be >= BATCH so all seqs decode concurrently
 )
 if cfg.get("attention_backend"):
@@ -233,6 +239,14 @@ def _read_probe(self):
 print("### warmup ###", flush=True)
 llm.generate(inputs_warm, sp_warm, use_tqdm=False)
 torch.cuda.synchronize()
+if _PFC:
+    # Prime the full prompt into the prefix cache OUTSIDE the profiler window, so
+    # the profiled generate skips prefill recompute (cache hit) -> decode-only trace.
+    print("### priming prefix cache (full prompt) ###", flush=True)
+    llm.generate(inputs_main, SamplingParams(temperature=0.0, max_tokens=1,
+                 ignore_eos=True), use_tqdm=False)
+    torch.cuda.synchronize()
+
 if _PROBE:
     llm.collective_rpc(_reset_probe)  # measure only the timed main generate
 
