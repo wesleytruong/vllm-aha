@@ -78,6 +78,7 @@ or individually (from the repo root):
 | **Amdahl curve** (e2e speedup vs context) | `python experiments/bench_amdahl.py --batch 1` | `results/amdahl/` |
 | **Batch × e2e** throughput | `python experiments/bench_batch_e2e.py` | `results/batch_e2e/` |
 | **ITL / TPOT** matrix (inter-token latency) | `python experiments/bench_itl_grid.py` | `results/itl/` |
+| **Online serving** (Poisson arrivals → TTFT/TPOT under load) | `python experiments/bench_serving.py` | `results/serving/` |
 | **Kernel-direct** decode sweep (nsys) + overrides | `python experiments/run_kernel_sweep.py` | `results/nsys_cachefix/`, `…_direct.json` |
 | **Routing** fraction vs context | `python probe_aha_gate_vs_seqlen.py` | `/tmp/aha_gate_vs_seqlen.csv` |
 | **Figures/CSVs** | `python experiments/make_figures.py` | `results/figures/` |
@@ -98,6 +99,14 @@ or individually (from the repo root):
   batch (no chunked-prefill interleave to subtract). Real-gate decode speedup is
   a flat ~2.7–3.5× across B=1→16; `dense-fi ≈ aha-global` validates the
   full-attention control. Each cell logs measured SWA% (routing).
+- **Online serving** — the only *realistic* test: a live `vllm serve` (continuous
+  batching, chunked prefill) hit with **Poisson arrivals** of real PG-19 prompts.
+  Reports TTFT and TPOT (p50/p99) and throughput, real-gate vs all-global, by
+  relaunching the server per mode with the gate override. Truncate runtime with
+  `--num-prompts` / `--max-seconds-per-run`. Note: prefill (hence TTFT *compute*)
+  is identical across modes — the gate is decode-only — so a TTFT gap under load
+  is a *queueing* effect: faster decode frees resources sooner. The static
+  Amdahl/ITL benches isolate the mechanism; this shows the realized serving win.
 - **Routing** — the gate's local-routing fraction vs sequence length (per-layer).
 
 ## Quality validation (planned, not in this suite)

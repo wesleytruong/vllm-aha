@@ -25,9 +25,14 @@ echo "===== 2/4  Kernel microbench (Level 1) + Amdahl curve (e2e vs context) ===
 python experiments/kernel_microbench.py || echo "WARN: kernel microbench failed (flashinfer?)"
 python experiments/bench_amdahl.py --batch 1
 
-echo "===== 3/4  Batch x e2e throughput + ITL/TPOT matrix ====="
+echo "===== 3/4  Batch x e2e throughput + ITL/TPOT matrix + online serving ====="
 python experiments/bench_batch_e2e.py
 python experiments/bench_itl_grid.py   # context x batch inter-token-latency matrix
+# Online serving (Poisson arrivals against a live vLLM server). Bigger GPUs can
+# push --input-len higher; --num-prompts bounds runtime. Skipped if it can't bind.
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  python experiments/bench_serving.py --input-len 8192 --request-rates "4,inf" \
+  --num-prompts 100 --gpu-mem 0.6 --max-num-seqs 64 || echo "WARN: serving bench failed"
 
 echo "===== 4/4  Kernel-direct decode sweep (nsys) + overrides + figures ====="
 # nsys + override sweep. Contexts/batches come from the GPU profile.
