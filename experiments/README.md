@@ -77,6 +77,7 @@ or individually (from the repo root):
 | **Kernel microbench** (Level 1, pure FlashInfer) | `python experiments/kernel_microbench.py` | `results/kernel_microbench.json` |
 | **Amdahl curve** (e2e speedup vs context) | `python experiments/bench_amdahl.py --batch 1` | `results/amdahl/` |
 | **Batch × e2e** throughput | `python experiments/bench_batch_e2e.py` | `results/batch_e2e/` |
+| **ITL / TPOT** matrix (inter-token latency) | `python experiments/bench_itl_grid.py` | `results/itl/` |
 | **Kernel-direct** decode sweep (nsys) + overrides | `python experiments/run_kernel_sweep.py` | `results/nsys_cachefix/`, `…_direct.json` |
 | **Routing** fraction vs context | `python probe_aha_gate_vs_seqlen.py` | `/tmp/aha_gate_vs_seqlen.csv` |
 | **Figures/CSVs** | `python experiments/make_figures.py` | `results/figures/` |

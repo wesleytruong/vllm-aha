@@ -25,8 +25,9 @@ echo "===== 2/4  Kernel microbench (Level 1) + Amdahl curve (e2e vs context) ===
 python experiments/kernel_microbench.py || echo "WARN: kernel microbench failed (flashinfer?)"
 python experiments/bench_amdahl.py --batch 1
 
-echo "===== 3/4  Batch x e2e throughput ====="
+echo "===== 3/4  Batch x e2e throughput + ITL/TPOT matrix ====="
 python experiments/bench_batch_e2e.py
+python experiments/bench_itl_grid.py   # context x batch inter-token-latency matrix
 
 echo "===== 4/4  Kernel-direct decode sweep (nsys) + overrides + figures ====="
 # nsys + override sweep. Contexts/batches come from the GPU profile.
