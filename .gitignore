@@ -245,3 +245,5 @@ vllm/grpc/vllm_engine_pb2.pyi
 
 # AHA experiment run outputs (large nsys binaries + regenerable result JSON/CSV)
 results/
+# SLURM job logs (transient, regenerated on resubmit)
+logs/

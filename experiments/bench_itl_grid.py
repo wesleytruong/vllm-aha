@@ -41,6 +41,9 @@ def main():
     ap.add_argument("--reps", type=int, default=4)
     ap.add_argument("--out-dir", default="results/itl")
     ap.add_argument("--python", default=sys.executable)
+    ap.add_argument("--skip-existing", action="store_true",
+                    help="reuse existing per-cell JSONs — run only the remaining "
+                         "cells of the grid (resume an interrupted/partial matrix)")
     args = ap.parse_args()
 
     contexts = ([int(x) for x in args.contexts.split(",")] if args.contexts
@@ -59,7 +62,14 @@ def main():
                 continue
             gm = gpu_mem_for(ctx, b, cfg["hbm_gb"])
             out = os.path.join(args.out_dir, f"grid_ctx{ctx}_b{b}.json")
-            mm = max(cfg["model_max"], ctx + args.gen_tokens + 64)
+            if args.skip_existing and os.path.exists(out):
+                print(f"  SKIP ctx={ctx} B={b}: exists ({out})", flush=True)
+                continue
+            # Size max_model_len to THIS cell only. Using the profile's global
+            # model_max (e.g. 263168) makes vLLM reserve KV for one max-len seq
+            # (~32GB), which contradicts the per-cell gpu_mem sizing and OOMs the
+            # small-ctx/low-gpu_mem cells. model_max doesn't affect TPOT.
+            mm = ctx + args.gen_tokens + 64
             env = os.environ.copy()
             print(f"\n=== ctx={ctx} B={b}  KV~{kv:.0f}GB  gpu_mem={gm} ===", flush=True)
             r = subprocess.run(

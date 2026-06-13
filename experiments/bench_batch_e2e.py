@@ -32,6 +32,9 @@ def main():
                     help="comma list; default = config.batches")
     ap.add_argument("--out-dir", default="results/batch_e2e")
     ap.add_argument("--python", default=sys.executable)
+    ap.add_argument("--skip-existing", action="store_true",
+                    help="reuse existing per-cell JSONs instead of recomputing "
+                         "them — lets a cancelled sweep resume on resubmit")
     args = ap.parse_args()
 
     batches = ([int(x) for x in args.batches.split(",")] if args.batches
@@ -44,6 +47,14 @@ def main():
     points = []
     for b in batches:
         out_json = os.path.join(args.out_dir, f"e2e_ctx{args.context}_b{b}.json")
+        if args.skip_existing and os.path.exists(out_json):
+            try:
+                with open(out_json) as f:
+                    points.append(json.load(f))
+                print(f"\n=== batch={b} === SKIP (reusing {out_json})", flush=True)
+                continue
+            except (json.JSONDecodeError, OSError):
+                print(f"  existing {out_json} unreadable; recomputing", flush=True)
         env = os.environ.copy()
         env.update(INPUT_LEN=str(args.context), AHA_BATCH=str(b),
                    AHA_MODEL_MAX=str(model_max), AHA_GPU_MEM=str(cfg["gpu_mem"]),

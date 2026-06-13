@@ -35,6 +35,9 @@ def main():
                     help="comma list; default = config.amdahl_contexts")
     ap.add_argument("--out-dir", default="results/amdahl")
     ap.add_argument("--python", default=sys.executable)
+    ap.add_argument("--skip-existing", action="store_true",
+                    help="reuse existing per-cell JSONs instead of recomputing "
+                         "them — lets a cancelled sweep resume on resubmit")
     args = ap.parse_args()
 
     contexts = ([int(x) for x in args.contexts.split(",")] if args.contexts
@@ -48,6 +51,15 @@ def main():
     points = []
     for ctx in contexts:
         out_json = os.path.join(args.out_dir, f"e2e_ctx{ctx}_b{args.batch}.json")
+        if args.skip_existing and os.path.exists(out_json):
+            try:
+                with open(out_json) as f:
+                    points.append(json.load(f))
+                print(f"\n=== context={ctx} === SKIP (reusing {out_json})",
+                      flush=True)
+                continue
+            except (json.JSONDecodeError, OSError):
+                print(f"  existing {out_json} unreadable; recomputing", flush=True)
         env = os.environ.copy()
         env.update(INPUT_LEN=str(ctx), AHA_BATCH=str(args.batch),
                    AHA_MODEL_MAX=str(model_max), AHA_GPU_MEM=str(cfg["gpu_mem"]),
