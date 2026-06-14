@@ -98,6 +98,10 @@ or individually (from the repo root):
   batch (no chunked-prefill interleave to subtract). Real-gate decode speedup is
   a flat ~2.7–3.5× across B=1→16; `dense-fi ≈ aha-global` validates the
   full-attention control. Each cell logs measured SWA% (routing).
+  The parsed per-cell numbers live in `results/nsys_cachefix_direct.json` and
+  `results/figures/decode_speedup.csv` (committed). The raw `.nsys-rep` captures
+  (~77 MB) are **not** in git — download them from the
+  [GH200 nsys captures release](https://github.com/wesleytruong/vllm-aha/releases/tag/gh200-nsys-captures).
 - **Routing** — the gate's local-routing fraction vs sequence length (per-layer).
 
 ## Quality validation (planned, not in this suite)

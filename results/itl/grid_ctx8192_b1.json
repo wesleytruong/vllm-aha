@@ -1,0 +1,36 @@
+{
+  "ctx": 8192,
+  "batch": 1,
+  "gen_tokens": 129,
+  "profile": "h100",
+  "modes": {
+    "real-gate": {
+      "tpot_ms": 2.3190406172943767,
+      "tok_s_seq": 431.2128009067385,
+      "total_tok_s": 431.2128009067385,
+      "speedup_vs_full": 1.0602218918620216,
+      "swa_pct": 85.06411427875244
+    },
+    "all-global": {
+      "tpot_ms": 2.458697630572715,
+      "tok_s_seq": 406.7193897962417,
+      "total_tok_s": 406.7193897962417,
+      "speedup_vs_full": 1.0,
+      "swa_pct": 0.0
+    },
+    "all-local": {
+      "tpot_ms": 2.14759882146609,
+      "tok_s_seq": 465.63631438265327,
+      "total_tok_s": 465.63631438265327,
+      "speedup_vs_full": 1.1448589028812413,
+      "swa_pct": 100.0
+    },
+    "half": {
+      "tpot_ms": 2.329114060557913,
+      "tok_s_seq": 429.3478009232666,
+      "total_tok_s": 429.3478009232666,
+      "speedup_vs_full": 1.0556364208216413,
+      "swa_pct": 50.0
+    }
+  }
+}
