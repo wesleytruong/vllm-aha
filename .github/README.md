@@ -74,7 +74,7 @@ or individually (from the repo root):
 
 | Experiment | Command | Output |
 |---|---|---|
-| **Kernel microbench** (Level 1, pure FlashInfer) | `python experiments/kernel_microbench.py` | `results/kernel_microbench.json` |
+| **Kernel microbench** (Level 1) — *in the [FlashInfer fork](https://github.com/wesleytruong/flashinfer-aha/tree/aha-router/benchmarks)* | `cd ../flashinfer && python benchmarks/bench_router_context_sweep.py` (+ `…_batch_sweep.py`) | `../flashinfer/benchmarks/sweep_logs/*.txt` |
 | **Amdahl curve** (e2e speedup vs context) | `python experiments/bench_amdahl.py --batch 1` | `results/amdahl/` |
 | **Batch × e2e** throughput | `python experiments/bench_batch_e2e.py` | `results/batch_e2e/` |
 | **ITL / TPOT** matrix (inter-token latency) | `python experiments/bench_itl_grid.py` | `results/itl/` |
@@ -84,17 +84,26 @@ or individually (from the repo root):
 
 ## 4. What each experiment shows
 
-- **Amdahl curve** — measured e2e decode speedup (real gate vs full attention)
-  rises with context as attention's share of the step grows, toward the kernel
-  ceiling. `amdahl_curve.csv` columns: context, batch, e2e_speedup,
-  alllocal_ceiling, real/full tok/s, routing %.
-- **Batch × e2e** — fixed per-step CPU/scheduling overhead amortizes with batch,
-  so e2e gain *grows* with batch; the decode-attention kernel speedup itself is
-  roughly flat in batch (see Kernel-direct), not eroding.
-- **Kernel-direct** — isolates the decode attention kernel per step (nsys). The
-  prompt is primed into the prefix cache *before* the profiler window
-  (`AHA_PFC_DECODE=1`), so the captured `generate` is a pure cache hit and the
-  trace contains only decode-shaped launches — clean decode isolation at ANY
+### Level 1 — Kernel microbench (in the FlashInfer fork)
+
+- **Router KV-skip microbench** — lives in the [FlashInfer fork](https://github.com/wesleytruong/flashinfer-aha/tree/aha-router/benchmarks):
+  `benchmarks/bench_router_kv_skip.py` (harness), driven by
+  `bench_router_context_sweep.py` (seq_len → 1M) and `bench_router_batch_sweep.py`
+  (batch → 256), plus a window sweep. It times the paged tensor-core decode kernel
+  at routing fractions {`plain_full`, `all-global`, `mix@50/70/90`, `all-local`}
+  and verifies the design claim directly: when a head routes local, out-of-window
+  KV tiles are **skipped** (predicated `cp_async` loads in `decode.cuh`), so DRAM
+  reads drop. So windowing makes the kernel cost
+  **context-flat** while full attention scales with context, and the per-launch
+  speedup is the kernel **ceiling** for that fraction (the real heterogeneous gate
+  realizes less — see L2). Result tables: `../flashinfer/benchmarks/sweep_logs/*.txt`.
+
+### Level 2 — Kernel-direct (the kernel inside live vLLM, nsys)
+
+- **Kernel-direct** (`run_kernel_sweep.py`) — isolates the decode attention kernel
+  per step. The prompt is primed into the prefix cache *before* the profiler
+  window (`AHA_PFC_DECODE=1`), so the captured `generate` is a pure cache hit and
+  the trace contains only decode-shaped launches — clean decode isolation at ANY
   batch (no chunked-prefill interleave to subtract). Real-gate decode speedup is
   a flat ~2.7–3.5× across B=1→16; `dense-fi ≈ aha-global` validates the
   full-attention control. Each cell logs measured SWA% (routing).
@@ -102,18 +111,53 @@ or individually (from the repo root):
   `results/figures/decode_speedup.csv` (committed). The raw `.nsys-rep` captures
   (~77 MB) are **not** in git — download them from the
   [GH200 nsys captures release](https://github.com/wesleytruong/vllm-aha/releases/tag/gh200-nsys-captures).
-- **Routing** — the gate's local-routing fraction vs sequence length (per-layer).
 
-## Quality validation (planned, not in this suite)
+### Level 3 — End-to-end (what the user actually sees)
 
-Quality is evaluated by running the **AHA paper's own benchmarks** through this
-vLLM integration via `lm-evaluation-harness` (`--model vllm`,
-`pretrained=xuan-luo/AHA-OLMO2,...`), real gate vs forced `all-global`. Note the
-integration gates **decode only** (prefill = full attention), while the paper
-gates *all* tokens — so only the paper's **generation** tasks (GSM8K, MBPP,
-MultiNews) exercise our gate; the multiple-choice tasks (MMLU, HellaSwag, CSQA)
-are loglikelihood/prefill-scored and read as full-attention (no-regression
-check). See the project notes for this fidelity-gap discussion.
+- **ITL / TPOT** (`bench_itl_grid.py`) — inter-token latency (TPOT = ms per output
+  token), the user-facing decode latency, swept over a context×batch grid with
+  batch held constant across contexts (a column isolates the context effect, a row
+  the batch effect). Real-gate vs full: the latency speedup **grows with both
+  context and batch**, from ~1.06× (8K, B=1) to ~2.0× (64K B=8 / 128K B=4) — e.g.
+  at 128K B=1 it cuts TPOT 7.2 → 4.4 ms (1.64×). `itl_summary.csv`: context,
+  batch, swa%, full/real TPOT ms, latency_speedup, tok/s, all-local floor.
+- **Amdahl curve** (`bench_amdahl.py`) — measured e2e decode speedup (real gate vs
+  full attention) rises with context as attention's share of the step grows,
+  toward the kernel ceiling. `amdahl_curve.csv` columns: context, batch,
+  e2e_speedup, alllocal_ceiling, real/full tok/s, routing %.
+- **Batch × e2e** (`bench_batch_e2e.py`) — fixed per-step CPU/scheduling overhead
+  amortizes with batch, so e2e gain *grows* with batch; the decode-attention
+  kernel speedup itself is roughly flat in batch (see Kernel-direct), not eroding.
+
+### Mechanism
+
+- **Routing** (`probe_aha_gate_vs_seqlen.py`) — the gate's local-routing fraction
+  vs sequence length (per-layer); ~70–85% local on PG-19 prose, the input that
+  drives every speedup above.
+
+## Validation
+
+**Kernel correctness — validated locally (unit test).** The router decode/prefill
+kernel is checked against a *blended* full + sliding-window reference in the
+FlashInfer fork's `tests/attention/test_router_attention.py`: per head, the router
+output must equal **full attention** where the gate routes global (`router==0`)
+and **sliding-window attention** where it routes local (`router==1`). All-global
+and all-local routers reproduce standard full / SWA attention exactly, and a mixed
+router matches each head's respective baseline — for both the decode and prefill
+wrappers, across batch sizes, context lengths, window sizes, and the tensor-core
+path (`rtol/atol = 1e-3`). A CUDA-graph regression test additionally flips the
+router in place across replays and asserts the output follows the *current*
+routing (the fix for the stale-buffer windowing bug; it also pins the polarity
+`1 == SWA`).
+
+**Task accuracy — separate suite.** End-task quality is evaluated by running the
+**AHA paper's own benchmarks** through this vLLM integration via
+`lm-evaluation-harness` (`--model vllm`, `pretrained=xuan-luo/AHA-OLMO2,...`), real
+gate vs forced `all-global`. The integration gates **decode only** (prefill = full
+attention) while the paper gates *all* tokens — so only the paper's **generation**
+tasks (GSM8K, MBPP, MultiNews) exercise our gate; the multiple-choice tasks (MMLU,
+HellaSwag, CSQA) are loglikelihood/prefill-scored and read as full attention (a
+no-regression check).
 
 ## 5. Notes / gotchas
 

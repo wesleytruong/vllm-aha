@@ -9,8 +9,9 @@ Measured at three scopes — pure kernel → kernel-in-engine → end-to-end. Th
 **not directly apples-to-apples** (see "Why the ratios differ" below).
 
 ## Level 1 — Standalone kernel microbench (pure FlashInfer, no engine)
-`experiments/kernel_microbench.py`. µs per decode launch, B=1, cudagraph, uniform
-routing fraction, vLLM's exact plan params. ×16 layers ≈ decode-attn/step;
+µs per decode launch, B=1, cudagraph, uniform routing fraction, vLLM's exact plan
+params (the L1 microbench now lives in the FlashInfer fork:
+`../flashinfer/benchmarks/bench_router_*.py`). ×16 layers ≈ decode-attn/step;
 excludes the split-KV merge + engine overhead, so this is the kernel CEILING for
 a *uniform* fraction.
 

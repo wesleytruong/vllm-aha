@@ -21,8 +21,9 @@ echo "===== 1/4  Data prep (PG-19) ====="
 python experiments/prepare_data.py --min-tokens 600000 || \
   echo "WARN: data prep failed; ensure .benchmark_datasets/ is rsync'd"
 
-echo "===== 2/4  Kernel microbench (Level 1) + Amdahl curve (e2e vs context) ====="
-python experiments/kernel_microbench.py || echo "WARN: kernel microbench failed (flashinfer?)"
+echo "===== 2/4  Amdahl curve (e2e vs context) ====="
+# Level-1 kernel microbench lives in the FlashInfer fork:
+#   cd ../flashinfer && python benchmarks/bench_router_context_sweep.py
 python experiments/bench_amdahl.py --batch 1
 
 echo "===== 3/4  Batch x e2e throughput + ITL/TPOT matrix ====="
